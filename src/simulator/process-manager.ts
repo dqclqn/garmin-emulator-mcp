@@ -2,6 +2,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
+import { createHash } from "node:crypto";
 import { spawn, execFile, ChildProcess } from "node:child_process";
 import type { GarminSdkPaths, Rect, WindowInfoResponse } from "../types.js";
 import { parseUnitTestOutput, type UnitTestSummary } from "./unit-results.js";
@@ -32,6 +33,7 @@ export interface BuildResult {
   outputPrgPath: string;
   stdout: string;
   stderr: string;
+  prgHash?: string;
 }
 
 export interface RunAppOptions {
@@ -85,6 +87,8 @@ export class SimulatorProcessManager {
   public readonly maxBufferSize: number;
   private currentDeviceId?: string;
   private activeProcess: ChildProcess | null = null;
+  private lastBuildPath?: string;
+  private lastBuildHash?: string;
 
   constructor(maxBufferSize = 500) {
     this.maxBufferSize = maxBufferSize;
@@ -465,6 +469,15 @@ export class SimulatorProcessManager {
   /**
    * Builds a Monkey C project using `monkeyc`.
    */
+  private async hashPrg(prgPath: string): Promise<string | undefined> {
+    try {
+      const data = await fs.promises.readFile(prgPath);
+      return createHash("sha256").update(data).digest("hex");
+    } catch {
+      return undefined;
+    }
+  }
+
   public async buildMonkeyCProject(
     sdkPaths: GarminSdkPaths,
     options: BuildProjectOptions
@@ -510,6 +523,8 @@ export class SimulatorProcessManager {
       child.on("error", (err: Error) => {
         const errorMsg = `Error executing monkeyc: ${err.message}`;
         this.appendLog("stderr", errorMsg);
+        this.lastBuildPath = path.resolve(outputPrgPath);
+        this.lastBuildHash = undefined;
         resolve({
           success: false,
           exitCode: 1,
@@ -519,14 +534,18 @@ export class SimulatorProcessManager {
         });
       });
 
-      child.on("close", (code: number | null) => {
+      child.on("close", async (code: number | null) => {
         const exitCode = code ?? -1;
         const stdoutStr = Buffer.concat(stdoutChunks).toString("utf-8");
         const stderrStr = Buffer.concat(stderrChunks).toString("utf-8");
         const success = exitCode === 0;
+        const prgHash = success ? await this.hashPrg(outputPrgPath) : undefined;
+
+        this.lastBuildPath = path.resolve(outputPrgPath);
+        this.lastBuildHash = prgHash;
 
         if (success) {
-          this.appendLog("system", `monkeyc build succeeded: ${outputPrgPath}`);
+          this.appendLog("system", `monkeyc build succeeded: ${outputPrgPath} (${prgHash ?? "no hash"})`);
         } else {
           this.appendLog("system", `monkeyc build failed with exit code ${exitCode}`);
         }
@@ -537,6 +556,7 @@ export class SimulatorProcessManager {
           outputPrgPath,
           stdout: stdoutStr,
           stderr: stderrStr,
+          prgHash,
         });
       });
     });
@@ -583,6 +603,32 @@ export class SimulatorProcessManager {
         activeDeviceId: options.deviceId,
         initialLogs: [err],
       };
+    }
+
+    if (this.lastBuildPath && path.resolve(this.lastBuildPath) === path.resolve(options.prgPath)) {
+      const currentHash = await this.hashPrg(options.prgPath);
+      if (!this.lastBuildHash) {
+        const err =
+          "E_STALE_PRG: the last build for this path failed, so the existing PRG is stale. Rebuild before running.";
+        this.appendLog("stderr", err);
+        return {
+          launched: false,
+          activeDeviceId: options.deviceId,
+          initialLogs: [err],
+          fatalError: err,
+        };
+      }
+      if (currentHash !== this.lastBuildHash) {
+        const err =
+          "E_STALE_PRG: the PRG on disk changed since the last successful build. Rebuild before running.";
+        this.appendLog("stderr", err);
+        return {
+          launched: false,
+          activeDeviceId: options.deviceId,
+          initialLogs: [err],
+          fatalError: err,
+        };
+      }
     }
 
     const args = this.buildMonkeyDoArgs(options.prgPath, options.deviceId);

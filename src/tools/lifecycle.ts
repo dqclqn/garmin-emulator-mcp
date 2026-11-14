@@ -4,7 +4,9 @@ import {
   listInstalledDevices,
   parseDeviceProfile,
 } from "../metadata/device-parser.js";
-import { getWindowInfo } from "../simulator/bridge.js";
+import { getActiveDesktop, getWindowInfo, setActiveDesktop } from "../simulator/bridge.js";
+import { launchIsolatedSimulator } from "../simulator/isolated.js";
+import { applyDebugConfig } from "./build-config.js";
 import { processManager } from "../simulator/process-manager.js";
 import {
   captureAndFormatScreenshot,
@@ -22,6 +24,8 @@ export interface SimulatorStatusResult {
   bounds?: { x: number; y: number; width: number; height: number };
   clientSize?: { width: number; height: number };
   foreground?: boolean;
+  isolated?: boolean;
+  desktop?: string;
   permissions: {
     screenRecording: boolean;
     accessibility: boolean;
@@ -64,6 +68,8 @@ export async function getSimulatorStatus(): Promise<SimulatorStatusResult> {
     bounds: windowInfo.bounds,
     clientSize: windowInfo.clientSize,
     foreground: windowInfo.foreground,
+    isolated: windowInfo.isolated ?? getActiveDesktop() !== undefined,
+    desktop: windowInfo.desktop ?? getActiveDesktop(),
     permissions: windowInfo.permissions,
     activeDeviceId,
   };
@@ -124,18 +130,95 @@ export async function handleSimulatorStatus(): Promise<{
  */
 export async function handleLaunchSimulator(args?: {
   wait_ms?: number;
+  isolated?: boolean;
 }): Promise<{
   content: McpToolContent[];
   isError?: boolean;
 }> {
   try {
     const sdkPaths = locateGarminSdk();
+    const activeDeviceId = getActiveDeviceId();
+
+    const existing = await getWindowInfo();
+    if (existing.running) {
+      const status = await getSimulatorStatus();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: true,
+                alreadyRunning: true,
+                isolated: existing.isolated ?? getActiveDesktop() !== undefined,
+                desktop: existing.desktop ?? getActiveDesktop(),
+                activeDeviceId,
+                windowId: existing.windowId,
+                bounds: existing.bounds,
+                clientSize: existing.clientSize,
+                permissions: status.permissions,
+                note: existing.isolated
+                  ? "The simulator is already running on an isolated desktop."
+                  : "The simulator is already running on the normal desktop. Terminate it first to relaunch isolated.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
+    const wantIsolated = args?.isolated !== false && process.platform === "win32";
+
+    if (wantIsolated) {
+      let expectedWidth: number | undefined;
+      try {
+        expectedWidth = resolveActiveDeviceProfile(activeDeviceId).bezelDimensions?.width;
+      } catch {
+        // The SDK may not be fully initialised yet.
+      }
+
+      const isolated = await launchIsolatedSimulator({
+        simulatorPath: sdkPaths.simulatorAppPath,
+        expectedClientWidth: expectedWidth,
+        waitMs: args?.wait_ms ?? 25000,
+      });
+      const status = await getSimulatorStatus();
+      const portOpen = await processManager.isSimulatorPortOpen(1234);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: true,
+                started: true,
+                isolated: true,
+                desktop: isolated.desktop,
+                portOpen,
+                ready: true,
+                activeDeviceId,
+                window: isolated.bounds,
+                clientSize: isolated.clientSize,
+                permissions: status.permissions,
+                note: "The simulator runs on a hidden desktop. Button input is delivered there without changing your foreground window.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: !portOpen,
+      };
+    }
+
+    setActiveDesktop(undefined);
     const result = await processManager.launchSimulatorApp(
       sdkPaths,
       args?.wait_ms ?? 15000
     );
-
-    const activeDeviceId = getActiveDeviceId();
     const status = await getSimulatorStatus();
 
     return {
@@ -148,6 +231,7 @@ export async function handleLaunchSimulator(args?: {
               started: result.started,
               portOpen: result.portOpen,
               ready: result.ready,
+              isolated: false,
               activeDeviceId,
               window: result.window,
               clientSize: result.clientSize,
@@ -281,6 +365,7 @@ export async function handleBuildApp(args: {
   developer_key_path?: string;
   output_prg_path?: string;
   extra_args?: string[];
+  debug_channel?: boolean;
 }): Promise<{
   content: McpToolContent[];
   isError?: boolean;
@@ -289,42 +374,52 @@ export async function handleBuildApp(args: {
     const sdkPaths = locateGarminSdk();
     const deviceId = getActiveDeviceId(args.device_id);
     const resolvedProjectDir = path.resolve(args.project_dir);
+    const restoreConfig = await applyDebugConfig(
+      resolvedProjectDir,
+      args.debug_channel !== false
+    );
 
-    const result = await processManager.buildMonkeyCProject(sdkPaths, {
-      projectDir: resolvedProjectDir,
-      deviceId,
-      jungleFile: args.jungle_file
-        ? path.resolve(args.jungle_file)
-        : undefined,
-      developerKeyPath: args.developer_key_path
-        ? path.resolve(args.developer_key_path)
-        : undefined,
-      outputPrgPath: args.output_prg_path
-        ? path.resolve(args.output_prg_path)
-        : undefined,
-      extraArgs: args.extra_args,
-    });
+    try {
+      const result = await processManager.buildMonkeyCProject(sdkPaths, {
+        projectDir: resolvedProjectDir,
+        deviceId,
+        jungleFile: args.jungle_file
+          ? path.resolve(args.jungle_file)
+          : undefined,
+        developerKeyPath: args.developer_key_path
+          ? path.resolve(args.developer_key_path)
+          : undefined,
+        outputPrgPath: args.output_prg_path
+          ? path.resolve(args.output_prg_path)
+          : undefined,
+        extraArgs: args.extra_args,
+      });
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              success: result.success,
-              exitCode: result.exitCode,
-              deviceId,
-              outputPrgPath: result.outputPrgPath,
-              stdout: result.stdout,
-              stderr: result.stderr,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-      isError: !result.success,
-    };
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: result.success,
+                exitCode: result.exitCode,
+                deviceId,
+                debugChannel: args.debug_channel !== false,
+                outputPrgPath: result.outputPrgPath,
+                prgHash: result.prgHash,
+                stdout: result.stdout,
+                stderr: result.stderr,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: !result.success,
+      };
+    } finally {
+      await restoreConfig();
+    }
   } catch (err: any) {
     return {
       content: [

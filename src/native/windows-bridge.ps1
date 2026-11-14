@@ -4,6 +4,7 @@ param(
   [switch]$HostMode
 )
 $ErrorActionPreference = 'Stop'
+$script:DesktopHandles = @{}
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing, Accessibility
 Add-Type -ReferencedAssemblies ([Accessibility.IAccessible].Assembly.Location) -TypeDefinition @'
@@ -30,6 +31,8 @@ public static class GarminWin {
  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint process);
  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+ [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr h);
+ [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
@@ -49,6 +52,55 @@ public static class GarminWin {
    } finally { Marshal.ReleaseComObject(accessible); }
  }
  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+ [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+ public struct STARTUPINFO { public int cb; public string lpReserved; public string lpDesktop; public string lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; }
+ [StructLayout(LayoutKind.Sequential)]
+ public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }
+ public delegate bool EnumDesktopProc(IntPtr h, IntPtr l);
+ [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateDesktop(string name, IntPtr device, IntPtr devmode, int flags, uint access, IntPtr sa);
+ [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr OpenDesktop(string name, int flags, bool inherit, uint access);
+ [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseDesktop(IntPtr h);
+ [DllImport("user32.dll", SetLastError=true)] public static extern bool EnumDesktopWindows(IntPtr desk, EnumDesktopProc cb, IntPtr l);
+ [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool CreateProcess(string app, System.Text.StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+ [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+ [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+ [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+ [DllImport("advapi32.dll", SetLastError=true)] public static extern bool GetTokenInformation(IntPtr token, int cls, out uint info, uint len, out uint ret);
+ public static bool IsProcessElevated(uint pid) {
+   IntPtr process = OpenProcess(0x1000, false, pid);
+   if (process == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+   try {
+     IntPtr token;
+     if (!OpenProcessToken(process, 0x0008, out token)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+     try {
+       uint elevated;
+       uint returned;
+       if (!GetTokenInformation(token, 20, out elevated, 4, out returned)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+       return elevated != 0;
+     } finally { CloseHandle(token); }
+   } finally { CloseHandle(process); }
+ }
+ public static bool IsCurrentElevated() { return IsProcessElevated((uint)System.Diagnostics.Process.GetCurrentProcess().Id); }
+ [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+ public static IntPtr[] DesktopWindows(string name) {
+   var desk = OpenDesktop(name, 0, false, 0x01FF);
+   if (desk == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+   var list = new System.Collections.Generic.List<IntPtr>();
+   try { EnumDesktopWindows(desk, delegate(IntPtr h, IntPtr l) { list.Add(h); return true; }, IntPtr.Zero); }
+   finally { CloseDesktop(desk); }
+   return list.ToArray();
+ }
+ public static int LaunchOnDesktop(string desktop, string exe, string args, string cwd) {
+   var si = new STARTUPINFO();
+   si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+   si.lpDesktop = "winsta0\\" + desktop;
+   var cmd = new System.Text.StringBuilder("\"" + exe + "\"");
+   if (!String.IsNullOrEmpty(args)) cmd.Append(" ").Append(args);
+   PROCESS_INFORMATION pi;
+   if (!CreateProcess(exe, cmd, IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, cwd, ref si, out pi)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+   CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+   return pi.dwProcessId;
+ }
  [DllImport("user32.dll")] public static extern IntPtr GetMenu(IntPtr h);
  [DllImport("user32.dll")] public static extern IntPtr GetSubMenu(IntPtr h, int index);
  [DllImport("user32.dll")] public static extern int GetMenuItemCount(IntPtr h);
@@ -74,7 +126,20 @@ function simulator {
   if ($candidates.Count -gt 1) { throw 'Multiple Garmin simulators match the SDK executable; close the extra instances' }
   if ($candidates.Count -eq 1) { return $candidates[0] }
 }
+function simulatorAny {
+  if (!$SimulatorPath) { throw 'Missing Garmin simulator executable path' }
+  $candidates = @(Get-Process simulator -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -and [string]::Equals([IO.Path]::GetFullPath($_.Path), $SimulatorPath, [StringComparison]::OrdinalIgnoreCase)
+  })
+  if ($candidates.Count -gt 1) { throw 'Multiple Garmin simulators match the SDK executable; close the extra instances' }
+  if ($candidates.Count -eq 1) { return $candidates[0] }
+}
 function win { $p = simulator; if (!$p) { throw 'Connect IQ simulator window is not running' }; return $p }
+function assertIntegrity($ownerPid) {
+  if ([GarminWin]::IsProcessElevated([uint32]$ownerPid) -ne [GarminWin]::IsCurrentElevated()) {
+    throw 'E_INTEGRITY_MISMATCH: The server and the simulator run at different integrity levels; window messages will be dropped. Run both elevated or both non-elevated.'
+  }
+}
 function clientSize($process) {
   $cr = New-Object GarminWin+RECT
   if (![GarminWin]::GetClientRect($process.MainWindowHandle, [ref]$cr)) { return $null }
@@ -192,23 +257,160 @@ function tree($el,$route,$depth,$max) {
   $node=@{path=@($route); AXRole=$el.Current.ControlType.ProgrammaticName; AXTitle=$el.Current.Name; AXIdentifier=$el.Current.AutomationId; AXEnabled=$el.Current.IsEnabled; childCount=$kids.Count}
   if ($depth -lt $max -and $script:count -lt 5000) { $nodes=@(); for ($i=0; $i -lt $kids.Count -and $script:count -lt 5000; $i++) { $nodes += (tree $kids[$i] ($route + $i) ($depth+1) $max) }; $node.children=$nodes } elseif ($kids.Count) { $node.truncated=$true }; return $node
 }
-function captureWindow($process, $path, $scale) {
+function captureHandle($hwnd, $path, $scale) {
   $r = New-Object GarminWin+RECT
-  [void][GarminWin]::GetWindowRect($process.MainWindowHandle, [ref]$r)
+  [void][GarminWin]::GetWindowRect([IntPtr]$hwnd, [ref]$r)
   $s = [double]$scale
   if ($s -le 0) { $s = 1 }
   $b = New-Object System.Drawing.Bitmap ([Math]::Max(1,[int](($r.Right-$r.Left)/$s))),([Math]::Max(1,[int](($r.Bottom-$r.Top)/$s)))
   $g = [System.Drawing.Graphics]::FromImage($b)
   try {
     $dc = $g.GetHdc()
-    try { if (![GarminWin]::PrintWindow($process.MainWindowHandle,$dc,2)) { throw 'Unable to capture simulator window' } } finally { $g.ReleaseHdc($dc) }
+    try { if (![GarminWin]::PrintWindow([IntPtr]$hwnd,$dc,2)) { throw 'Unable to capture simulator window' } } finally { $g.ReleaseHdc($dc) }
     $b.Save([string]$path,[System.Drawing.Imaging.ImageFormat]::Png)
   } finally { $g.Dispose(); $b.Dispose() }
 }
+function captureWindow($process, $path, $scale) {
+  captureHandle $process.MainWindowHandle $path $scale
+}
+function simWindows($process) {
+  $list = @()
+  $h = [GarminWin]::GetTopWindow([IntPtr]::Zero)
+  while ($h -ne [IntPtr]::Zero) {
+    $owner = [uint32]0
+    [void][GarminWin]::GetWindowThreadProcessId($h, [ref]$owner)
+    if ($owner -eq $process.Id) {
+      $r = New-Object GarminWin+RECT
+      [void][GarminWin]::GetWindowRect($h, [ref]$r)
+      $list += @{hwnd=$h.ToInt64(); title=[GarminWin]::Title($h); class=[GarminWin]::Cls($h); visible=[GarminWin]::IsWindowVisible($h); rect=@{x=$r.Left; y=$r.Top; width=($r.Right-$r.Left); height=($r.Bottom-$r.Top)}}
+    }
+    $h = [GarminWin]::GetWindow($h, 2)
+  }
+  return $list
+}
+function childWindows($parent, $depth) {
+  $list = @()
+  $h = [GarminWin]::GetWindow([IntPtr]$parent, 5)
+  while ($h -ne [IntPtr]::Zero) {
+    $r = New-Object GarminWin+RECT
+    [void][GarminWin]::GetWindowRect($h, [ref]$r)
+    $node = @{hwnd=$h.ToInt64(); class=[GarminWin]::Cls($h); title=[GarminWin]::Title($h); visible=[GarminWin]::IsWindowVisible($h); rect=@{x=$r.Left; y=$r.Top; width=($r.Right-$r.Left); height=($r.Bottom-$r.Top)}}
+    if ($depth -gt 1) {
+      $kids = @(childWindows $h ($depth - 1))
+      if ($kids.Count -gt 0) { $node.children = $kids }
+    }
+    $list += $node
+    $h = [GarminWin]::GetWindow($h, 2)
+  }
+  return $list
+}
 function Invoke-One($a) {
  switch ($a[0]) {
+ 'integrity' {
+   $targetPid=[uint32](opt '--pid' 0)
+   $hostElev=[GarminWin]::IsCurrentElevated()
+   $targetElev=$null
+   if ($targetPid -ne 0) { $targetElev=[GarminWin]::IsProcessElevated($targetPid) }
+   output @{ok=$true; hostElevated=$hostElev; targetPid=$targetPid; targetElevated=$targetElev; same=($null -eq $targetElev -or $hostElev -eq $targetElev)}
+ }
+ 'create-desktop' {
+   $name=opt '--name' ''; if (!$name) { throw 'Desktop name is required' }
+   if (!$script:DesktopHandles.ContainsKey($name)) {
+     $h=[GarminWin]::CreateDesktop($name,[IntPtr]::Zero,[IntPtr]::Zero,0,0x01FF,[IntPtr]::Zero)
+     if ($h -eq [IntPtr]::Zero) { throw ('CreateDesktop failed: ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+     $script:DesktopHandles[$name]=$h
+   }
+   output @{ok=$true; name=$name}
+ }
+ 'close-desktop' {
+   $name=opt '--name' ''; if (!$name) { throw 'Desktop name is required' }
+   if ($script:DesktopHandles.ContainsKey($name)) {
+     [void][GarminWin]::CloseDesktop($script:DesktopHandles[$name]); $script:DesktopHandles.Remove($name)
+     output @{ok=$true; name=$name}; break
+   }
+   $h=[GarminWin]::OpenDesktop($name,0,$false,0x01FF)
+   if ($h -eq [IntPtr]::Zero) { output @{ok=$true; alreadyClosed=$true}; break }
+   [void][GarminWin]::CloseDesktop($h)
+   output @{ok=$true; name=$name}
+ }
+ 'launch-on-desktop' {
+   $desktop=opt '--desktop' ''; $exe=opt '--exe' ''; $extra=opt '--args' ''
+   if (!$desktop -or !$exe) { throw 'desktop and exe are required' }
+   if (!$script:DesktopHandles.ContainsKey($desktop)) {
+     $h=[GarminWin]::CreateDesktop($desktop,[IntPtr]::Zero,[IntPtr]::Zero,0,0x01FF,[IntPtr]::Zero)
+     if ($h -eq [IntPtr]::Zero) { throw ('CreateDesktop failed: ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+     $script:DesktopHandles[$desktop]=$h
+   }
+   $procId=[GarminWin]::LaunchOnDesktop($desktop,$exe,$extra,(Get-Location).Path)
+   output @{ok=$true; pid=$procId; desktop=$desktop; exe=$exe}
+ }
+ 'desktop-click' {
+   $desktop=opt '--desktop' ''; $hwnd=[IntPtr][long](opt '--hwnd' 0)
+   if (!$desktop -or $hwnd -eq [IntPtr]::Zero) { throw 'desktop and hwnd are required' }
+   $x=[int](opt '--x' 0); $y=[int](opt '--y' 0); $hold=[Math]::Max(1,[int](opt '--hold-ms' 80))
+   $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId($hwnd,[ref]$owner)
+   $proc=if ($owner -ne 0) { Get-Process -Id $owner -ErrorAction SilentlyContinue } else { $null }
+   if (!$proc -or $proc.ProcessName -ne 'simulator') { throw 'Click target does not belong to a simulator process' }
+   assertIntegrity $owner
+   $lp=[IntPtr](($y -shl 16) -bor ($x -band 0xFFFF))
+   [void][GarminWin]::SendMessage($hwnd,0x0200,[IntPtr]::Zero,$lp)
+   [void][GarminWin]::SendMessage($hwnd,0x0201,[IntPtr]1,$lp)
+   Start-Sleep -Milliseconds $hold
+   [void][GarminWin]::SendMessage($hwnd,0x0202,[IntPtr]::Zero,$lp)
+   output @{ok=$true; hwnd=$hwnd.ToInt64(); x=$x; y=$y; holdMs=$hold}
+ }
+ 'desktop-drag' {
+   $desktop=opt '--desktop' ''; $hwnd=[IntPtr][long](opt '--hwnd' 0)
+   if (!$desktop -or $hwnd -eq [IntPtr]::Zero) { throw 'desktop and hwnd are required' }
+   $x1=[int](opt '--x1' 0); $y1=[int](opt '--y1' 0); $x2=[int](opt '--x2' 0); $y2=[int](opt '--y2' 0)
+   $duration=[Math]::Max(20,[int](opt '--duration-ms' 400))
+   $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId($hwnd,[ref]$owner)
+   $proc=if ($owner -ne 0) { Get-Process -Id $owner -ErrorAction SilentlyContinue } else { $null }
+   if (!$proc -or $proc.ProcessName -ne 'simulator') { throw 'Drag target does not belong to a simulator process' }
+   assertIntegrity $owner
+   $start=[IntPtr](($y1 -shl 16) -bor ($x1 -band 0xFFFF))
+   [void][GarminWin]::SendMessage($hwnd,0x0200,[IntPtr]::Zero,$start)
+   [void][GarminWin]::SendMessage($hwnd,0x0201,[IntPtr]1,$start)
+   try {
+     for ($i=1;$i -le 20;$i++) {
+       $mx=[int]($x1+($x2-$x1)*$i/20); $my=[int]($y1+($y2-$y1)*$i/20)
+       $lp=[IntPtr](($my -shl 16) -bor ($mx -band 0xFFFF))
+       [void][GarminWin]::SendMessage($hwnd,0x0200,[IntPtr]1,$lp)
+       Start-Sleep -Milliseconds ([int]($duration/20))
+     }
+   } finally {
+     $end=[IntPtr](($y2 -shl 16) -bor ($x2 -band 0xFFFF))
+     [void][GarminWin]::SendMessage($hwnd,0x0202,[IntPtr]::Zero,$end)
+   }
+   output @{ok=$true; hwnd=$hwnd.ToInt64(); x1=$x1; y1=$y1; x2=$x2; y2=$y2}
+ }
+ 'desktop-key' {
+   $desktop=opt '--desktop' ''; $hwnd=[IntPtr][long](opt '--hwnd' 0)
+   if (!$desktop -or $hwnd -eq [IntPtr]::Zero) { throw 'desktop and hwnd are required' }
+   $v=[int](opt '--code' 0); $hold=[Math]::Max(1,[int](opt '--hold-ms' 80))
+   $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId($hwnd,[ref]$owner)
+   assertIntegrity $owner
+   [void][GarminWin]::SendMessage($hwnd,0x0100,[IntPtr]$v,[IntPtr]0x001C0001)
+   Start-Sleep -Milliseconds $hold
+   [void][GarminWin]::SendMessage($hwnd,0x0101,[IntPtr]$v,[IntPtr]([int64]0xC01C0001))
+   output @{ok=$true; hwnd=$hwnd.ToInt64(); code=$v}
+ }
  'window-info' {
-  $p=simulator; $permissions=@{screenRecording=$true; accessibility=$true}
+  $permissions=@{screenRecording=$true; accessibility=$true}
+  $desktop=opt '--desktop' ''
+  if ($desktop) {
+    try { $wins=[GarminWin]::DesktopWindows($desktop) } catch { output @{running=$false; isolated=$true; desktop=$desktop; permissions=$permissions; error=$_.Exception.Message}; break }
+    $main=[IntPtr]::Zero
+    foreach ($w in $wins) { if ([GarminWin]::Title($w) -like 'CIQ Simulator*') { $main=$w; break } }
+    if ($main -eq [IntPtr]::Zero) { output @{running=$false; isolated=$true; desktop=$desktop; permissions=$permissions; error="Connect IQ simulator is not running on desktop $desktop"}; break }
+    $r=New-Object GarminWin+RECT; [void][GarminWin]::GetWindowRect($main,[ref]$r)
+    $pt=New-Object GarminWin+POINT; [void][GarminWin]::ClientToScreen($main,[ref]$pt)
+    $cr=New-Object GarminWin+RECT; [void][GarminWin]::GetClientRect($main,[ref]$cr)
+    $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId($main,[ref]$owner)
+    output @{running=$true; pid=$owner; windowId=$main.ToInt64(); bounds=@{x=$r.Left; y=$r.Top; width=($r.Right-$r.Left); height=($r.Bottom-$r.Top)}; clientSize=@{width=($cr.Right-$cr.Left); height=($cr.Bottom-$cr.Top)}; contentOffset=@{x=($pt.X-$r.Left); y=($pt.Y-$r.Top)}; scale=1; foreground=$false; isolated=$true; desktop=$desktop; permissions=$permissions}
+    break
+  }
+  $p=simulator
   if (!$p) { output @{running=$false; permissions=$permissions; error='Connect IQ simulator is not running'}; break }
   $r=New-Object GarminWin+RECT; [void][GarminWin]::GetWindowRect($p.MainWindowHandle,[ref]$r)
   $pt=New-Object GarminWin+POINT; [void][GarminWin]::ClientToScreen($p.MainWindowHandle,[ref]$pt)
@@ -259,7 +461,41 @@ function Invoke-One($a) {
    if ($root -ne [IntPtr]::Zero) { [void][GarminWin]::GetWindowThreadProcessId($root,[ref]$owner) }
    output @{ok=$true; x=$x; y=$y; hwnd=$root.ToInt64(); targetHwnd=$target.ToInt64(); title=if($root -eq [IntPtr]::Zero){''}else{[GarminWin]::Title($root)}; class=if($target -eq [IntPtr]::Zero){''}else{[GarminWin]::Cls($target)}; pid=$owner}
  }
- 'capture' { $p=win; if ($p.MainWindowHandle.ToInt64() -ne [long]$a[1]) { throw 'Simulator window changed' }; captureWindow $p $a[2] ([double]::Parse($a[3],[System.Globalization.CultureInfo]::InvariantCulture)); output @{ok=$true} }
+ 'children' {
+   $hwnd=[long](opt '--hwnd' 0); $depth=[int](opt '--depth' 3)
+   if ($hwnd -eq 0) { $p=win; $hwnd=$p.MainWindowHandle.ToInt64() }
+   output @{ok=$true; hwnd=$hwnd; children=@(childWindows $hwnd $depth)}
+ }
+ 'windows' {
+   $desktop=opt '--desktop' ''
+   if ($desktop) {
+     $wins=[GarminWin]::DesktopWindows($desktop); $list=@()
+     foreach ($h in $wins) {
+       $r=New-Object GarminWin+RECT; [void][GarminWin]::GetWindowRect($h,[ref]$r)
+       $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId($h,[ref]$owner)
+       $list += @{hwnd=$h.ToInt64(); title=[GarminWin]::Title($h); class=[GarminWin]::Cls($h); visible=[GarminWin]::IsWindowVisible($h); pid=$owner; rect=@{x=$r.Left; y=$r.Top; width=($r.Right-$r.Left); height=($r.Bottom-$r.Top)}}
+     }
+     output @{ok=$true; desktop=$desktop; windows=$list}; break
+   }
+   $p=win; output @{ok=$true; pid=$p.Id; windows=@(simWindows $p)}
+ }
+ 'close-window' {
+   $hwnd=[IntPtr][long](opt '--hwnd' 0)
+   if ($hwnd -eq [IntPtr]::Zero) { $p=win; $hwnd=$p.MainWindowHandle }
+   $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId($hwnd,[ref]$owner)
+   $proc=if ($owner -ne 0) { Get-Process -Id $owner -ErrorAction SilentlyContinue } else { $null }
+   if (!$proc -or $proc.ProcessName -ne 'simulator') { throw 'Window does not belong to a simulator process' }
+   [void][GarminWin]::PostMessage($hwnd,0x0010,[UIntPtr]::Zero,[IntPtr]::Zero)
+   Start-Sleep -Milliseconds 300
+   output @{ok=$true; hwnd=$hwnd.ToInt64(); visible=[GarminWin]::IsWindowVisible($hwnd)}
+ }
+ 'capture' {
+   $hwnd=[IntPtr][long]$a[1]
+   $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId($hwnd,[ref]$owner)
+   $proc=if ($owner -ne 0) { Get-Process -Id $owner -ErrorAction SilentlyContinue } else { $null }
+   if (!$proc -or $proc.ProcessName -ne 'simulator') { throw 'Capture target does not belong to a simulator process' }
+   captureHandle $hwnd $a[2] ([double]::Parse($a[3],[System.Globalization.CultureInfo]::InvariantCulture)); output @{ok=$true; hwnd=$hwnd.ToInt64()}
+ }
  'click' {
    $p=inputWindow; $x=[int](opt '--x' 0); $y=[int](opt '--y' 0)
    assertPointOver $p $x $y
@@ -276,10 +512,36 @@ function Invoke-One($a) {
    output @{ok=$true; x1=$x1; y1=$y1; x2=$x2; y2=$y2}
  }
  'key' { [void](inputWindow); $v=[byte](opt '--code' 0); [GarminWin]::keybd_event($v,0,0,[UIntPtr]::Zero); try { Start-Sleep -Milliseconds ([int](opt '--hold-ms' 80)) } finally { [GarminWin]::keybd_event($v,0,2,[UIntPtr]::Zero) }; output @{ok=$true} }
- 'menu' { $p=win; $menu=[GarminWin]::GetMenu($p.MainWindowHandle); $parts=@($a[2..($a.Count-1)]); for ($j=0;$j -lt $parts.Count;$j++) { $found=-1; for ($i=0;$i -lt [GarminWin]::GetMenuItemCount($menu);$i++) { $label=New-Object System.Text.StringBuilder 512; [void][GarminWin]::GetMenuString($menu,$i,$label,512,1024); if (($label.ToString().Split("`t")[0] -replace '&','').Trim() -eq $parts[$j]) { $found=$i; break } }; if ($found -lt 0) { throw "Menu item not found: $($parts[$j])" }; if (([GarminWin]::GetMenuState($menu,$found,1024) -band 3) -ne 0) { throw "Menu item is disabled: $($parts[$j])" }; if ($j -eq $parts.Count-1) { $id=[GarminWin]::GetMenuItemID($menu,$found); if ($id -eq [uint32]::MaxValue -or ![GarminWin]::PostMessage($p.MainWindowHandle,273,[UIntPtr]$id,[IntPtr]::Zero)) { throw 'Unable to invoke menu item' } } else { $menu=[GarminWin]::GetSubMenu($menu,$found); if ($menu -eq [IntPtr]::Zero) { throw 'Menu has no submenu' } } }; output @{ok=$true; path=$parts} }
- 'menu-id' { $p=win; $id=[uint32](opt '--id' 0); if (![GarminWin]::PostMessage($p.MainWindowHandle,273,[UIntPtr]$id,[IntPtr]::Zero)) { throw 'Unable to invoke menu item' }; output @{ok=$true; id=$id} }
- 'ui-tree' { $p=win; $script:count=0; output @{ok=$true; pid=$p.Id; tree=(tree (root $p) @() 0 ([Math]::Min(14,[Math]::Max(1,[int]$a[1]))))} }
- 'ui-action' { $el=root (win); foreach ($part in $a[1].Split('.')) { $kids=children $el; $i=0; if (![int]::TryParse($part,[ref]$i) -or $i -lt 0 -or $i -ge $kids.Count) { throw 'Invalid or stale element path' }; $el=$kids[$i] }; switch ($a[2]) { 'focus' { $el.SetFocus() } 'select' { $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select() } 'set' { $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue([string]$a[3]) } { $_ -in 'AXPress','AXConfirm' } { invokeElement $el } { $_ -in 'AXIncrement','AXDecrement' } { $p=$el.GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern); $delta=$p.Current.SmallChange; if ($_ -eq 'AXDecrement') { $delta=-$delta }; $p.SetValue([Math]::Max($p.Current.Minimum,[Math]::Min($p.Current.Maximum,$p.Current.Value+$delta))) } default { throw 'Unsupported UI action' } }; output @{ok=$true} }
+ 'menu' { $hwnd=[long](opt '--hwnd' 0); if ($hwnd -eq 0) { $p=win; $hwnd=$p.MainWindowHandle.ToInt64() }; $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId([IntPtr]$hwnd,[ref]$owner); assertIntegrity $owner; $menu=[GarminWin]::GetMenu([IntPtr]$hwnd); $parts=@($a[2..($a.Count-1)]); for ($j=0;$j -lt $parts.Count;$j++) { $found=-1; for ($i=0;$i -lt [GarminWin]::GetMenuItemCount($menu);$i++) { $label=New-Object System.Text.StringBuilder 512; [void][GarminWin]::GetMenuString($menu,$i,$label,512,1024); if (($label.ToString().Split("`t")[0] -replace '&','').Trim() -eq $parts[$j]) { $found=$i; break } }; if ($found -lt 0) { throw "Menu item not found: $($parts[$j])" }; if (([GarminWin]::GetMenuState($menu,$found,1024) -band 3) -ne 0) { throw "Menu item is disabled: $($parts[$j])" }; if ($j -eq $parts.Count-1) { $id=[GarminWin]::GetMenuItemID($menu,$found); if ($id -eq [uint32]::MaxValue -or ![GarminWin]::PostMessage([IntPtr]$hwnd,273,[UIntPtr]$id,[IntPtr]::Zero)) { throw 'Unable to invoke menu item' } } else { $menu=[GarminWin]::GetSubMenu($menu,$found); if ($menu -eq [IntPtr]::Zero) { throw 'Menu has no submenu' } } }; output @{ok=$true; path=$parts} }
+ 'menu-id' {
+   $hwnd=[long](opt '--hwnd' 0)
+   if ($hwnd -eq 0) { $p=win; $hwnd=$p.MainWindowHandle.ToInt64() }
+   $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId([IntPtr]$hwnd,[ref]$owner)
+   assertIntegrity $owner
+   $id=[uint32](opt '--id' 0)
+   if (![GarminWin]::PostMessage([IntPtr]$hwnd,273,[UIntPtr]$id,[IntPtr]::Zero)) { throw 'Unable to invoke menu item' }
+   output @{ok=$true; id=$id; hwnd=$hwnd}
+ }
+ 'ui-tree' {
+   $script:count=0; $hwnd=[long](opt '--hwnd' 0)
+   if ($hwnd -ne 0) {
+     $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId([IntPtr]$hwnd,[ref]$owner)
+     $proc=if ($owner -ne 0) { Get-Process -Id $owner -ErrorAction SilentlyContinue } else { $null }
+     if (!$proc -or $proc.ProcessName -ne 'simulator') { throw 'Window does not belong to a simulator process' }
+     $el=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$hwnd); $target=$hwnd; $procId=$owner
+   } else { $p=win; $el=root $p; $target=$p.MainWindowHandle.ToInt64(); $procId=$p.Id }
+   output @{ok=$true; pid=$procId; hwnd=$target; tree=(tree $el @() 0 ([Math]::Min(14,[Math]::Max(1,[int]$a[1]))))}
+ }
+ 'ui-action' {
+   $hwnd=[long](opt '--hwnd' 0)
+   if ($hwnd -ne 0) {
+     $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId([IntPtr]$hwnd,[ref]$owner)
+     $proc=if ($owner -ne 0) { Get-Process -Id $owner -ErrorAction SilentlyContinue } else { $null }
+     if (!$proc -or $proc.ProcessName -ne 'simulator') { throw 'Window does not belong to a simulator process' }
+     $el=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$hwnd)
+   } else { $p=win; $el=root $p }
+   foreach ($part in $a[1].Split('.')) { $kids=children $el; $i=0; if (![int]::TryParse($part,[ref]$i) -or $i -lt 0 -or $i -ge $kids.Count) { throw 'Invalid or stale element path' }; $el=$kids[$i] }; switch ($a[2]) { 'focus' { $el.SetFocus() } 'select' { $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select() } 'set' { $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue([string]$a[3]) } { $_ -in 'AXPress','AXConfirm' } { invokeElement $el } { $_ -in 'AXIncrement','AXDecrement' } { $p=$el.GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern); $delta=$p.Current.SmallChange; if ($_ -eq 'AXDecrement') { $delta=-$delta }; $p.SetValue([Math]::Max($p.Current.Minimum,[Math]::Min($p.Current.Maximum,$p.Current.Value+$delta))) } default { throw 'Unsupported UI action' } }; output @{ok=$true}
+ }
  'storage-close' {
   $p=win; $dialog=storageEditor $p
   if (!$dialog) { output @{ok=$true; alreadyClosed=$true}; break }
@@ -309,7 +571,12 @@ function Invoke-One($a) {
     } finally { $bitmap.Dispose() }
   } finally { $stream.Dispose() }
  }
- 'terminate' { $p=simulator; if (!$p) { output @{ok=$true; alreadyStopped=$true}; break }; if ($a -contains '--force') { $p.Kill() } else { [void]$p.CloseMainWindow() }; $stopped=$p.WaitForExit(5000); output @{ok=$stopped; terminated=$stopped; pid=$p.Id} }
+ 'terminate' {
+   $p=simulatorAny
+   if (!$p) { output @{ok=$true; alreadyStopped=$true}; break }
+   if ($a -contains '--force' -or $p.MainWindowHandle -eq 0) { $p.Kill() } else { [void]$p.CloseMainWindow() }
+   $stopped=$p.WaitForExit(5000); output @{ok=$stopped; terminated=$stopped; pid=$p.Id}
+ }
  default { throw "Unsupported Windows bridge command: $($a[0])" }
  }
 }

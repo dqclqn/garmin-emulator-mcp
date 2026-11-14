@@ -4,7 +4,11 @@ import {
 } from "../metadata/device-parser.js";
 import {
   clickScreenPoint,
+  desktopClick,
+  desktopDrag,
   dragScreenPoints,
+  getActiveDesktop,
+  getWindowChildren,
   getWindowInfo,
   sendKeyCode,
 } from "../simulator/bridge.js";
@@ -21,7 +25,7 @@ import {
   type ScreenExpectation,
 } from "./action-receipt.js";
 import { describeFocusFailure } from "./lease.js";
-import type { DeviceKeyMapping, DeviceProfile, Point } from "../types.js";
+import type { DeviceKeyMapping, DeviceProfile, Point, Rect, WindowInfoResponse } from "../types.js";
 
 /**
  * Maps semantic button IDs/aliases to virtual keycodes on macOS.
@@ -72,6 +76,99 @@ export function getVirtualKeyCodeForButton(keyId: string): number | undefined {
   }
 }
 
+
+interface IsolatedPanel {
+  desktop: string;
+  hwnd: number;
+  rect: Rect;
+  windowInfo: WindowInfoResponse;
+}
+
+/** Finds the custom watch canvas on the isolated desktop, if isolation is active. */
+async function isolatedPanel(): Promise<IsolatedPanel | null> {
+  const desktop = getActiveDesktop();
+  if (!desktop) {
+    return null;
+  }
+  const windowInfo = await getWindowInfo(desktop);
+  if (!windowInfo.running || !windowInfo.windowId) {
+    throw new Error(
+      "The isolated simulator window is not available. Launch it again with launch_simulator."
+    );
+  }
+  const children = await getWindowChildren(windowInfo.windowId, 2);
+  const panels = ((children.children ?? []) as any[])
+    .filter((child) => child.class === "wxWindowNR" && child.rect?.width > 0)
+    .sort((a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height);
+  const panel = panels[0];
+  if (!panel) {
+    throw new Error("Could not find the simulator canvas on the isolated desktop.");
+  }
+  return {
+    desktop,
+    hwnd: panel.hwnd,
+    rect: panel.rect,
+    windowInfo,
+  };
+}
+
+function toPanelPoint(screenPoint: Point, panel: IsolatedPanel): Point {
+  return {
+    x: screenPoint.x - panel.rect.x,
+    y: screenPoint.y - panel.rect.y,
+  };
+}
+
+function focusMode(): "lease" | "none" {
+  return getActiveDesktop() ? "none" : "lease";
+}
+
+/** Clicks a screen point on the isolated desktop, or the visible desktop. */
+async function inputClick(screenPoint: Point, holdMs: number): Promise<void> {
+  const panel = await isolatedPanel();
+  if (panel) {
+    const point = toPanelPoint(screenPoint, panel);
+    await desktopClick(panel.desktop, panel.hwnd, point.x, point.y, holdMs);
+    return;
+  }
+  await clickScreenPoint(screenPoint.x, screenPoint.y, holdMs);
+}
+
+/** Drags between two screen points on the isolated desktop, or the visible desktop. */
+async function inputDrag(
+  start: Point,
+  end: Point,
+  durationMs: number
+): Promise<void> {
+  const panel = await isolatedPanel();
+  if (panel) {
+    await desktopDrag(
+      panel.desktop,
+      panel.hwnd,
+      toPanelPoint(start, panel),
+      toPanelPoint(end, panel),
+      durationMs
+    );
+    return;
+  }
+  await dragScreenPoints(start.x, start.y, end.x, end.y, durationMs);
+}
+
+/**
+ * Sends a virtual key on the visible desktop. Posted key messages are not
+ * reliable on the isolated desktop because the simulator polls real key state,
+ * so isolated callers must use the pointer path instead.
+ */
+async function inputKey(keyCode: number, holdMs: number): Promise<void> {
+  const panel = await isolatedPanel();
+  if (panel) {
+    throw new Error(
+      "Isolated desktop input uses pointer messages. Key injection is not reliable there; use press_button or tap_screen instead."
+    );
+  }
+  await sendKeyCode(keyCode, holdMs);
+}
+
 interface PerformButtonPressResult {
   profile: DeviceProfile;
   keyMapping: DeviceKeyMapping;
@@ -114,7 +211,7 @@ async function performButtonPress(options: {
       getVirtualKeyCodeForButton(options.button);
 
     if (keyCode !== undefined) {
-      await sendKeyCode(keyCode, holdDuration);
+      await inputKey(keyCode, holdDuration);
       return {
         profile,
         keyMapping,
@@ -139,7 +236,7 @@ async function performButtonPress(options: {
     profile, windowInfo.scale ? windowInfo.contentOffset : undefined, windowInfo.scale
   );
 
-  await clickScreenPoint(screenPt.x, screenPt.y, holdDuration);
+  await inputClick(screenPt, holdDuration);
 
   return {
     profile,
@@ -174,6 +271,7 @@ export async function handlePressButton(args: {
       settleMs,
       captureAfter: args.capture_after !== false,
       tag: `press-${args.button}`,
+      focus: focusMode(),
       action: async () =>
         performButtonPress({
           button: args.button,
@@ -244,6 +342,7 @@ export async function handlePressButtonSequence(args: {
       settleMs: args.settle_ms ?? 400,
       captureAfter: args.capture_after !== false,
       tag: "sequence",
+      focus: focusMode(),
       action: async () => {
         let lastDeviceId = args.device_id;
         for (let i = 0; i < steps.length; i++) {
@@ -326,6 +425,7 @@ export async function handleTapScreen(args: {
       settleMs: args.settle_ms ?? args.wait_ms ?? 400,
       captureAfter: args.capture_after !== false,
       tag: "tap",
+      focus: focusMode(),
       action: async () => {
         const windowInfo = await getWindowInfo();
         if (!windowInfo.running || !windowInfo.bounds) {
@@ -338,7 +438,7 @@ export async function handleTapScreen(args: {
           windowInfo.bounds,
           profile, windowInfo.scale ? windowInfo.contentOffset : undefined, windowInfo.scale
         );
-        await clickScreenPoint(screenPt.x, screenPt.y, 80);
+        await inputClick(screenPt, 80);
         return screenPt;
       },
     });
@@ -401,6 +501,7 @@ export async function handleSwipeScreen(args: {
       settleMs: args.settle_ms ?? args.wait_ms ?? 400,
       captureAfter: args.capture_after !== false,
       tag: `swipe-${args.direction}`,
+      focus: focusMode(),
       action: async () => {
         const windowInfo = await getWindowInfo();
         if (!windowInfo.running || !windowInfo.bounds) {
@@ -418,13 +519,7 @@ export async function handleSwipeScreen(args: {
           windowInfo.bounds,
           profile, windowInfo.scale ? windowInfo.contentOffset : undefined, windowInfo.scale
         );
-        await dragScreenPoints(
-          startScreen.x,
-          startScreen.y,
-          endScreen.x,
-          endScreen.y,
-          durationMs
-        );
+        await inputDrag(startScreen, endScreen, durationMs);
         return { startScreen, endScreen };
       },
     });
@@ -491,6 +586,7 @@ export async function handleHoldScreen(args: {
       settleMs: args.settle_ms ?? args.wait_ms ?? 400,
       captureAfter: args.capture_after !== false,
       tag: "hold",
+      focus: focusMode(),
       action: async () => {
         const windowInfo = await getWindowInfo();
         if (!windowInfo.running || !windowInfo.bounds) {
@@ -503,7 +599,7 @@ export async function handleHoldScreen(args: {
           windowInfo.bounds,
           profile, windowInfo.scale ? windowInfo.contentOffset : undefined, windowInfo.scale
         );
-        await clickScreenPoint(screenPt.x, screenPt.y, duration);
+        await inputClick(screenPt, duration);
         return screenPt;
       },
     });
@@ -570,7 +666,8 @@ export async function handleSendKey(args: {
       settleMs: args.settle_ms ?? args.wait_ms ?? 400,
       captureAfter: args.capture_after === true,
       tag: "key",
-      action: () => sendKeyCode(keyCode as number, holdDuration),
+      focus: focusMode(),
+      action: () => inputKey(keyCode as number, holdDuration),
     });
 
     const statusText =

@@ -10,6 +10,18 @@ import type { Point, Rect, WindowInfoResponse } from "../types.js";
 
 const execFileAsync = promisify(execFile);
 
+let activeDesktop: string | undefined;
+
+/** Sets the isolated desktop that all window and capture calls should target. */
+export function setActiveDesktop(name: string | undefined): void {
+  activeDesktop = name;
+}
+
+/** Returns the isolated desktop name, or undefined for the normal desktop. */
+export function getActiveDesktop(): string | undefined {
+  return activeDesktop;
+}
+
 /**
  * Resolves the path to the compiled macos-bridge binary.
  */
@@ -346,8 +358,110 @@ export function computeCanvasOrigin(
 /**
  * Inspects running Connect IQ simulator window information, bounds, and permissions.
  */
-export async function getWindowInfo(): Promise<WindowInfoResponse> {
-  return await runBridgeCommand(["window-info"]);
+export async function getWindowInfo(desktop = activeDesktop): Promise<WindowInfoResponse> {
+  return await runBridgeCommand(["window-info", ...(desktop ? ["--desktop", desktop] : [])]);
+}
+
+/** Creates a hidden desktop, or reuses one already open in the bridge host. */
+export async function createDesktop(name: string) {
+  return runBridgeCommand(["create-desktop", "--name", name]);
+}
+
+/** Closes a hidden desktop after its simulator has stopped. */
+export async function closeDesktop(name: string) {
+  return runBridgeCommand(["close-desktop", "--name", name]);
+}
+
+/** Launches an executable on a hidden desktop and returns its process id. */
+export async function launchOnDesktop(desktop: string, exe: string, args?: string) {
+  return runBridgeCommand([
+    "launch-on-desktop",
+    "--desktop",
+    desktop,
+    "--exe",
+    exe,
+    ...(args ? ["--args", args] : []),
+  ]);
+}
+
+/** Lists windows on a hidden desktop, including dialogs. */
+export async function listWindowsOnDesktop(desktop: string) {
+  return runBridgeCommand(["windows", "--desktop", desktop]);
+}
+
+/** Returns direct and nested children of a window handle. */
+export async function getWindowChildren(hwnd: number, depth = 3) {
+  return runBridgeCommand(["children", "--hwnd", String(hwnd), "--depth", String(depth)]);
+}
+
+/** Sends a mouse click to a window on a hidden desktop without focus. */
+export async function desktopClick(
+  desktop: string,
+  hwnd: number,
+  x: number,
+  y: number,
+  holdMs = 80
+) {
+  return runBridgeCommand([
+    "desktop-click",
+    "--desktop",
+    desktop,
+    "--hwnd",
+    String(hwnd),
+    "--x",
+    String(x),
+    "--y",
+    String(y),
+    "--hold-ms",
+    String(holdMs),
+  ]);
+}
+
+/** Sends a drag to a window on a hidden desktop without focus. */
+export async function desktopDrag(
+  desktop: string,
+  hwnd: number,
+  from: Point,
+  to: Point,
+  durationMs = 400
+) {
+  return runBridgeCommand([
+    "desktop-drag",
+    "--desktop",
+    desktop,
+    "--hwnd",
+    String(hwnd),
+    "--x1",
+    String(from.x),
+    "--y1",
+    String(from.y),
+    "--x2",
+    String(to.x),
+    "--y2",
+    String(to.y),
+    "--duration-ms",
+    String(durationMs),
+  ]);
+}
+
+/** Sends a key to a window on a hidden desktop without focus. */
+export async function desktopKey(
+  desktop: string,
+  hwnd: number,
+  code: number,
+  holdMs = 80
+) {
+  return runBridgeCommand([
+    "desktop-key",
+    "--desktop",
+    desktop,
+    "--hwnd",
+    String(hwnd),
+    "--code",
+    String(code),
+    "--hold-ms",
+    String(holdMs),
+  ]);
 }
 
 export interface FocusResponse {
@@ -488,6 +602,20 @@ export async function sendKeyCode(keyCode: number, holdMs?: number): Promise<voi
 export async function triggerMenu(
   menuPath: string[]
 ): Promise<{ ok: boolean; error?: string }> {
+  const desktop = activeDesktop;
+  if (desktop) {
+    const info = await getWindowInfo(desktop);
+    if (!info.windowId) {
+      return { ok: false, error: "The isolated simulator window is not available." };
+    }
+    return await runBridgeCommand([
+      "menu",
+      "--path",
+      ...menuPath,
+      "--hwnd",
+      String(info.windowId),
+    ]);
+  }
   return await runBridgeCommand(["menu", "--path", ...menuPath]);
 }
 
@@ -496,7 +624,36 @@ export async function triggerMenu(
  * without focus, which makes them suitable for unattended state changes.
  */
 export async function triggerMenuId(id: number): Promise<{ ok: boolean; error?: string }> {
+  const desktop = activeDesktop;
+  if (desktop) {
+    const info = await getWindowInfo(desktop);
+    if (!info.windowId) {
+      return { ok: false, error: "The isolated simulator window is not available." };
+    }
+    return await runBridgeCommand([
+      "menu-id",
+      "--id",
+      String(id),
+      "--hwnd",
+      String(info.windowId),
+    ]);
+  }
   return await runBridgeCommand(["menu-id", "--id", String(id)]);
+}
+
+/**
+ * Lists top-level windows owned by the simulator process, including dialogs.
+ */
+export async function listSimulatorWindows() {
+  const desktop = activeDesktop;
+  return runBridgeCommand(["windows", ...(desktop ? ["--desktop", desktop] : [])]);
+}
+
+/**
+ * Closes a simulator-owned window (a dialog, not the main window).
+ */
+export async function closeSimulatorWindow(hwnd: number) {
+  return runBridgeCommand(["close-window", "--hwnd", String(hwnd)]);
 }
 
 /**

@@ -16,6 +16,7 @@ export interface RunWithReceiptOptions<T> {
   captureAfter?: boolean;
   saveCapture?: boolean;
   tag?: string;
+  focus?: "lease" | "none";
 }
 
 export interface RunWithReceiptResult<T> {
@@ -41,7 +42,7 @@ async function safeCapture(): Promise<ScreenSnapshot | undefined> {
 export async function runWithReceipt<T>(
   options: RunWithReceiptOptions<T>
 ): Promise<RunWithReceiptResult<T>> {
-  const lease = await acquireInputLease();
+  const lease = options.focus === "none" ? undefined : await acquireInputLease();
   const settleMs = options.settleMs ?? 400;
   try {
     const before = await safeCapture();
@@ -72,9 +73,16 @@ export async function runWithReceipt<T>(
       }
     }
 
-    return { result, receipt, content, focusPath: lease.path };
+    return {
+      result,
+      receipt,
+      content,
+      focusPath: lease ? lease.path : "isolated-desktop",
+    };
   } finally {
-    await releaseInputLease(lease);
+    if (lease) {
+      await releaseInputLease(lease);
+    }
   }
 }
 

@@ -33,8 +33,25 @@ import {
   handleTriggerMenuAction,
 } from "./tools/environment.js";
 import { handleDoctor } from "./tools/doctor.js";
+import {
+  handleCaptureWindow,
+  handleCloseWindow,
+  handleListWindows,
+} from "./tools/dialogs.js";
+import { handleCalibrate, handleMatrixDiff, handleMatrixRun } from "./tools/matrix.js";
+import { handleResetState } from "./tools/state.js";
+import {
+  handleDebugCommand,
+  handleDebugPing,
+  handleDebugStatus,
+  handleStateRead,
+  handleStateReset,
+  handleStateSeed,
+  handleSetTime,
+} from "./tools/debug.js";
 import { handleDiff, handleWaitForStable } from "./tools/observation.js";
 import { placeSimulatorWindow } from "./simulator/bridge.js";
+import { killIsolatedSimulatorSync, terminateIsolatedSimulator } from "./simulator/isolated.js";
 import { acquireSessionLock, releaseSessionLock, sessionId } from "./session/session.js";
 
 /**
@@ -76,13 +93,19 @@ export function createServer(): McpServer {
 
   server.tool(
     "launch_simulator",
-    "Launch the Garmin Connect IQ simulator application (ConnectIQ.app) from the SDK and wait for its TCP port 1234 to be open.",
+    "Launch the Garmin Connect IQ simulator, by default on a hidden Windows desktop where button input does not change your foreground window.",
     {
       wait_ms: z
         .number()
         .optional()
         .describe(
-          "Maximum milliseconds to wait for the simulator TCP port 1234 to open (default: 15000)"
+          "Maximum milliseconds to wait for the simulator window and TCP port 1234 (default: 25000 isolated, 15000 normal)"
+        ),
+      isolated: z
+        .boolean()
+        .optional()
+        .describe(
+          "Run on a hidden desktop (default: true on Windows). Set false to use the visible desktop and the focus lease."
         ),
     },
     async (args) => handleLaunchSimulator(args)
@@ -154,6 +177,12 @@ export function createServer(): McpServer {
         .array(z.string())
         .optional()
         .describe("Extra CLI flags to pass directly to monkeyc"),
+      debug_channel: z
+        .boolean()
+        .optional()
+        .describe(
+          "Swap in the debug automation config before building (default: true). Set false for a release build with the channel disabled."
+        ),
     },
     async (args) => handleBuildApp(args)
   );
@@ -559,21 +588,39 @@ export function createServer(): McpServer {
     async (args) => handleSetGlanceMode(args)
   );
 
-  server.tool("inspect_ui", "Read simulator Accessibility hierarchy, including menus and native dialogs. Paths are ephemeral: inspect before acting.",
-    { depth: z.number().int().min(1).max(14).default(7) },
-    async ({ depth }) => testingResult(() => inspectUI(depth)));
-  server.tool("act_on_ui", "Act on a freshly inspected native simulator element. set writes AXValue; AXPress activates controls.",
-    { path: z.array(z.number().int().nonnegative()).min(1), action: z.enum(["set", "select", "focus", "AXPress", "AXConfirm", "AXIncrement", "AXDecrement"]), value: z.string().optional() },
-    async (args) => testingResult(() => actOnUI(args.path, args.action, args.value)));
+  server.tool("inspect_ui", "Read simulator Accessibility hierarchy, including menus and native dialogs. Pass hwnd to inspect a dialog from list_windows. Paths are ephemeral: inspect before acting.",
+    {
+      depth: z.number().int().min(1).max(14).default(7),
+      hwnd: z.number().int().optional().describe("Window handle from list_windows; omit for the main simulator window"),
+    },
+    async ({ depth, hwnd }) => testingResult(() => inspectUI(depth, hwnd)));
+  server.tool("act_on_ui", "Act on a freshly inspected native simulator element. set writes AXValue; AXPress activates controls. Pass hwnd for dialogs.",
+    {
+      path: z.array(z.number().int().nonnegative()).min(1),
+      action: z.enum(["set", "select", "focus", "AXPress", "AXConfirm", "AXIncrement", "AXDecrement"]),
+      value: z.string().optional(),
+      hwnd: z.number().int().optional().describe("Window handle from list_windows; omit for the main simulator window"),
+    },
+    async (args) => testingResult(() => actOnUI(args.path, args.action, args.value, args.hwnd)));
   server.tool("snapshot_app_files", "Back up only files matching explicit PRG basenames from simulator APPS. Does not stop the app; use an idle/stopped session.",
     { directory: z.string(), app_names: z.array(z.string()) },
     async (args) => testingResult(() => snapshotAppFiles(args.directory, args.app_names)));
   server.tool("restore_app_files", "Restore a verified app-scoped snapshot. Requires explicit confirmation and a stopped app; never use while app/background writes are active.",
     { directory: z.string(), app_names: z.array(z.string()), confirm_stopped: z.literal(true) },
     async (args) => testingResult(() => restoreAppFiles(args.directory, args.app_names)));
-  server.tool("terminate_simulator", "Terminate only ConnectIQ.app; force is for an unresponsive simulator. Does not delete stored data. Relaunch separately after confirming stopped status.",
+  server.tool("terminate_simulator", "Terminate only ConnectIQ.app and destroy its isolated desktop if one was used. Force is for an unresponsive simulator. Does not delete stored data.",
     { force: z.boolean().default(false) },
-    async ({ force }) => testingResult(() => runBridgeCommand(["terminate", ...(force ? ["--force"] : [])])));
+    async ({ force }) => {
+      try {
+        const result = await terminateIsolatedSimulator(force);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+          isError: true,
+        };
+      }
+    });
   server.tool("recognize_image_text", "Recognize text in a saved simulator PNG using on-device OCR. Returns text and normalized bounds; confidence is available on macOS. OCR is evidence, not a replacement for storage assertions.",
     { image_path: z.string() },
     async ({ image_path }) => testingResult(() => runBridgeCommand(["ocr", image_path])));
@@ -632,6 +679,177 @@ export function createServer(): McpServer {
     async (args) => handleDoctor(args)
   );
 
+  server.tool(
+    "debug_status",
+    "Report the local debug channel endpoint, whether the app has polled it, and the last command result.",
+    {},
+    async () => handleDebugStatus()
+  );
+
+  server.tool(
+    "debug_ping",
+    "Round-trip a ping through the in-app debug channel. Proves the app is running and polling without touching focus.",
+    {
+      timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 10000)"),
+    },
+    async (args) => handleDebugPing(args)
+  );
+
+  server.tool(
+    "state_read",
+    "Read the app's storage and property state through the in-app debug channel. Values are scalar summaries; arrays report size.",
+    {
+      keys: z
+        .array(z.string())
+        .optional()
+        .describe("Only return these storage keys (property names are matched with or without the prop: prefix)"),
+      timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 10000)"),
+    },
+    async (args) => handleStateRead(args)
+  );
+
+  server.tool(
+    "state_seed",
+    "Write storage keys through the in-app debug channel, then optionally read them back to verify. Use null to delete a key.",
+    {
+      values: z
+        .record(z.any())
+        .describe(
+          "Storage values to write: scalar, string array, or a flat object. premium expects { active: boolean, code: string }; deck_list expects an array of ids."
+        ),
+      verify: z.boolean().optional().describe("Read back and compare after writing (default: true)"),
+      timeout_ms: z.number().optional().describe("Per-command timeout in milliseconds (default: 10000)"),
+    },
+    async (args) => handleStateSeed(args)
+  );
+
+  server.tool(
+    "state_reset",
+    "Clear every app storage key through the in-app debug channel and optionally report the resulting state.",
+    {
+      verify: z.boolean().optional().describe("Read state after clearing (default: true)"),
+      timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 10000)"),
+    },
+    async (args) => handleStateReset(args)
+  );
+
+  server.tool(
+    "set_time",
+    "Shift the app's clock through the debug channel. Use an ISO timestamp or an offset in seconds. Only code paths using DebugClock follow the offset.",
+    {
+      offset_seconds: z.number().optional().describe("Seconds to add to the app clock"),
+      iso: z.string().optional().describe("Target ISO timestamp to move the app clock to"),
+      clear: z.boolean().optional().describe("Reset the offset to zero"),
+      timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 10000)"),
+    },
+    async (args) => handleSetTime(args)
+  );
+
+  server.tool(
+    "debug_command",
+    "Send a raw command to the in-app debug channel. Verbs: ping, state, seed, reset; arguments are semicolon-free strings.",
+    {
+      verb: z.string().describe("Command verb, for example state"),
+      args: z.array(z.string()).optional().describe("Positional arguments after the verb"),
+      timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 10000)"),
+    },
+    async (args) => handleDebugCommand(args)
+  );
+
+  server.tool(
+    "list_windows",
+    "List every top-level window owned by the simulator, including storage, login, time and phone-message dialogs. Use the hwnd with inspect_ui, capture_window or act_on_ui.",
+    {},
+    async () => handleListWindows()
+  );
+
+  server.tool(
+    "capture_window",
+    "Capture a simulator-owned dialog or window by hwnd. Returns the PNG image and optional saved path.",
+    {
+      hwnd: z.number().int().describe("Window handle from list_windows"),
+      save_path: z.string().optional().describe("Optional file path to save the PNG"),
+    },
+    async (args) => handleCaptureWindow(args)
+  );
+
+  server.tool(
+    "close_window",
+    "Close a simulator-owned dialog by hwnd. Refuses to close the main simulator window.",
+    {
+      hwnd: z.number().int().describe("Window handle from list_windows"),
+    },
+    async (args) => handleCloseWindow(args)
+  );
+
+  server.tool(
+    "reset_state",
+    "Reset persisted app data through the simulator menu, with a screenshot and optional APPS snapshot first. Requires confirm: true. Restart the app afterwards to observe a clean launch.",
+    {
+      scope: z
+        .enum(["app", "all_apps", "simulator"])
+        .optional()
+        .describe("app clears this app's data; all_apps deletes every app; simulator resets the simulator"),
+      confirm: z.literal(true).describe("Must be true; this is destructive"),
+      snapshot: z.boolean().optional().describe("Snapshot APP files before resetting (default: true for app scope)"),
+      snapshot_dir: z.string().optional().describe("Directory for the snapshot"),
+      verify: z.boolean().optional().describe("Read state through the debug channel after reset (default: true)"),
+      wait_ms: z.number().optional().describe("Settle time after invoking the menu (default: 1200)"),
+      stop_app: z
+        .boolean()
+        .optional()
+        .describe("Kill the running app first so cached state cannot rewrite storage (default: true)"),
+    },
+    async (args) => handleResetState(args)
+  );
+
+  server.tool(
+    "matrix_run",
+    "Build, run and capture one screen per device, then compare each against .ciq/baselines. Creates baselines when missing or when update_baselines is true. No input or focus required.",
+    {
+      project_dir: z.string().describe("Monkey C project directory"),
+      devices: z.array(z.string()).min(1).describe("Device ids from list_devices"),
+      baseline_dir: z.string().optional().describe("Baseline directory (default: <project>/.ciq/baselines)"),
+      output_dir: z.string().optional().describe("Current capture directory (default: <project>/.ciq/current)"),
+      update_baselines: z.boolean().optional().describe("Overwrite baselines with this run"),
+      wait_ms: z.number().optional().describe("Monkeydo startup wait per device (default: 3000)"),
+      settle_ms: z.number().optional().describe("Extra settle time before capture (default: 1200)"),
+      threshold: z.number().optional().describe("Per-pixel channel delta for diffs (default: 12)"),
+      jungle_file: z.string().optional().describe("Explicit jungle file"),
+      developer_key_path: z.string().optional().describe("Explicit developer key"),
+      debug_channel: z
+        .boolean()
+        .optional()
+        .describe("Build with the debug automation channel (default: true)"),
+      reset_before_each: z
+        .boolean()
+        .optional()
+        .describe("Clear app storage and stop the app before each device (default: true)"),
+    },
+    async (args) => handleMatrixRun(args)
+  );
+
+  server.tool(
+    "matrix_diff",
+    "Compare every baseline PNG in a directory with the matching current PNG and report changed percentage and bounds.",
+    {
+      baseline_dir: z.string().describe("Directory containing baseline PNGs"),
+      output_dir: z.string().optional().describe("Directory containing current PNGs (default: sibling 'current')"),
+      threshold: z.number().optional().describe("Per-pixel channel delta (default: 12)"),
+    },
+    async (args) => handleMatrixDiff(args)
+  );
+
+  server.tool(
+    "calibrate",
+    "Report window, bezel and display geometry plus every button centre mapped to screen coordinates, and check each point is inside the window. Optionally save a raw screenshot.",
+    {
+      device_id: z.string().optional().describe("Device id (defaults to active device)"),
+      save_path: z.string().optional().describe("Optional file path for a raw simulator screenshot"),
+    },
+    async (args) => handleCalibrate(args)
+  );
+
   return server;
 }
 
@@ -651,6 +869,7 @@ export async function main(): Promise<void> {
     }
     process.once("exit", releaseSessionLock);
   }
+  process.once("exit", killIsolatedSimulatorSync);
   const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);

@@ -78,6 +78,8 @@ export interface WindowInfoResponse {
   contentOffset?: Point;
   scale?: number;
   foreground?: boolean;
+  isolated?: boolean;
+  desktop?: string;
   permissions: {
     screenRecording: boolean;
     accessibility: boolean;

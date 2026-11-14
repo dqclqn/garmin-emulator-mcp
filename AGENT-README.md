@@ -4,7 +4,7 @@ This file is the operating reference for an AI agent driving this server. The hu
 
 - Transport: stdio, one JSON-RPC session.
 - Entry point: `node /path/to/garmin-simulator-mcp/dist/index.js`.
-- Tools: 29. Optional parameters are marked `?`.
+- Tools: 43. Optional parameters are marked `?`.
 - One server may drive the simulator at a time. A second instance exits with code 2 and names the lock owner.
 
 ## Suggested loop
@@ -15,7 +15,8 @@ This file is the operating reference for an AI agent driving this server. The hu
 4. `wait_for_stable`, then `get_screenshot`.
 5. `press_button` (or `press_button_sequence`) with `expect: "change"`.
 6. `get_app_logs` for `System.println` output and crashes.
-7. `terminate_simulator` when finished.
+7. Optionally `debug_ping` and `state_read` to confirm app state without focus.
+8. `terminate_simulator` when finished.
 
 ## Response contract
 
@@ -24,6 +25,8 @@ This file is the operating reference for an AI agent driving this server. The hu
 - `expect: "change"` turns an unchanged screen into `isError: true` with `E_NO_CHANGE`.
 - `expect: "noop"` turns an unexpected change into `isError: true` with `E_UNEXPECTED_CHANGE`.
 - Refused input returns `E_FOCUS_DENIED` with the blocking window title and pid, or an explicit "no foreground window" when the desktop is locked.
+- `E_STALE_PRG` means the PRG on disk no longer matches the last successful build; rebuild before running.
+- `E_INTEGRITY_MISMATCH` means the server and simulator run at different elevation levels; messages would be dropped.
 - A changed screen means pixels moved, not that the app reached the intended state. Combine receipts with logs.
 
 ## Environment
@@ -48,12 +51,12 @@ macOS needs Screen Recording and Accessibility permissions for the terminal or I
 
 | Tool | Parameters | Behaviour |
 |---|---|---|
-| `simulator_status` | none | Running state, window id, bounds, client size, foreground flag, TCP 1234 state, permission fields, active device profile. |
-| `launch_simulator` | `wait_ms?` (15000) | Launches the simulator, waits for port 1234, then waits for sane window geometry. Returns `started`, `portOpen`, `ready`, `window`, `clientSize`. Clamps an off-screen window into the work area. |
+| `simulator_status` | none | Running state, window id, bounds, client size, foreground flag, `isolated`, `desktop`, TCP 1234 state, permission fields, active device profile. |
+| `launch_simulator` | `wait_ms?` (25000), `isolated?` (true on Windows) | Creates a hidden desktop and launches the simulator there, then waits for the final client size. Returns `started`, `portOpen`, `ready`, `isolated`, `desktop`, `window`, `clientSize`. Set `isolated: false` for the visible desktop and the focus lease. If a simulator is already running, it reports `alreadyRunning` instead of relaunching. |
 | `list_devices` | `query?`, `touch_only?` | Installed profiles with resolution, touch support, shape and buttons. |
 | `set_active_device` | `device_id` | Sets the metadata profile only. It does not switch the running simulator device. Pass the same `device_id` to build and run. |
-| `build_app` | `project_dir`, `device_id?`, `jungle_file?`, `developer_key_path?`, `output_prg_path?`, `extra_args?` | Compiles with `monkeyc`. Returns `success`, `exitCode`, `deviceId`, `outputPrgPath`, `stdout`, `stderr`. |
-| `run_app` | `prg_path`, `device_id?`, `wait_ms?` (2500), `capture_after?` (true) | Pushes the PRG with `monkeydo` and streams logs. `startupConfirmed` stays false unless a known startup marker appears; judge from logs and screenshots. |
+| `build_app` | `project_dir`, `device_id?`, `jungle_file?`, `developer_key_path?`, `output_prg_path?`, `extra_args?`, `debug_channel?` (true) | Compiles with `monkeyc`, swapping in the debug or release automation config first. Returns `success`, `exitCode`, `deviceId`, `debugChannel`, `outputPrgPath`, `prgHash`, `stdout`, `stderr`. |
+| `run_app` | `prg_path`, `device_id?`, `wait_ms?` (2500), `capture_after?` (true) | Pushes the PRG with `monkeydo` and streams logs. Refuses a PRG whose hash differs from the last successful build for that path with `E_STALE_PRG`. `startupConfirmed` stays false unless a known startup marker appears; judge from logs and screenshots. |
 | `stop_app` | none | Stops the managed launcher only. The app can keep running in the simulator. |
 | `run_unit_tests` | `prg_path`, `device_id?`, `test_name?`, `timeout_ms?` (30000) | Runs `monkeydo -t` and parses the result table. Requires a complete, consistent, passing table with no fatal output, signal or timeout. |
 | `terminate_simulator` | `force?` (false) | Graceful close, waiting up to 5s. Use `force: true` only for an unresponsive simulator. |
@@ -75,9 +78,24 @@ All input tools return a receipt and accept `expect` and `settle_ms`.
 
 Input rules:
 
-- The server takes foreground once per press or sequence, verifies the simulator owns the click point, injects, then restores the previously focused window.
-- Input is impossible while the Windows session is locked. Capture, diff, menu commands and window placement still work.
-- If the simulator is not foreground and Windows refuses activation, the call fails with `E_FOCUS_DENIED` and names the blocker. Do not retry in a loop; report it.
+- In isolated mode, input is sent with `SendMessage` to the watch canvas on the hidden desktop. No foreground change, no focus lease, and the receipt reports `focus isolated-desktop`.
+- In normal mode, the server takes foreground once per press or sequence, verifies the simulator owns the click point, injects, then restores the previously focused window.
+- Normal-mode input is impossible while the Windows session is locked. Isolated-mode input, capture, diff and menu commands still work while locked.
+- If normal-mode input is refused, the call fails with `E_FOCUS_DENIED` and names the blocker. Do not retry in a loop; report it.
+
+### Isolated desktop (Windows, default)
+
+`launch_simulator` creates a desktop named `ciq-mcp-<session-suffix>` and starts the simulator there with `CreateProcess` and `lpDesktop`. The window is never visible on the user's desktop. Capture uses `PrintWindow`; input uses `WM_MOUSEMOVE`, `WM_LBUTTONDOWN` and `WM_LBUTTONUP` posted to the custom `wxWindowNR` watch canvas. Menu commands use `WM_COMMAND` to the hidden main window. `send_key` uses `WM_KEYDOWN` and `WM_KEYUP` to the canvas.
+
+- No focus lease is acquired, and `SetForegroundWindow` is never called.
+- `list_windows`, `capture_window`, `close_window`, `reset_state` and `inspect_ui` with an explicit `hwnd` target the hidden desktop.
+- `run_app` works normally because monkeydo talks to the simulator over TCP 1234.
+- `terminate_simulator` kills the process and closes the desktop. Server exit also kills an isolated simulator, so it cannot be orphaned.
+- Pointer input is the verified path. The simulator imports `GetAsyncKeyState`, `GetKeyState`, `RegisterHotKey` and `SetWindowsHookExW`, so posted key messages are unreliable and may be ignored. `send_key` and `press_button` with `method: "key"` return an error on an isolated desktop; use `press_button` or `tap_screen`.
+- The same imports mean the hidden simulator may observe real keystrokes while you type in another app. Do not treat the hidden desktop as a security boundary; test with real typing before relying on it.
+- Message injection requires the server and the simulator to run at the same integrity level. The bridge checks this and throws `E_INTEGRITY_MISMATCH` instead of silently dropping input.
+- If a simulator is already running on the normal desktop, terminate it before launching isolated.
+- macOS has no isolated desktop path. `isolated` is ignored and the normal visible-desktop flow is used.
 
 ### Visual inspection
 
@@ -95,9 +113,41 @@ Input rules:
 |---|---|---|
 | `trigger_menu_action` | `menu_path[]`, `capture_after?`, `wait_ms?` | Clicks a native simulator menu item, for example `["Simulation", "Activity Data"]`. Menu commands work without focus. |
 | `set_glance_mode` | `enabled?`, `capture_after?`, `wait_ms?` | Sets Glance Launch Mode. Omit `enabled` to toggle based on `simulator.ini`. |
-| `inspect_ui` | `depth?` (1 to 14, default 7) | Reads the native accessibility tree. The watch canvas is not exposed as native controls. |
-| `act_on_ui` | `path[]`, `action` (set, select, focus, AXPress, AXConfirm, AXIncrement, AXDecrement), `value?` | Acts on a freshly inspected element. Paths are ephemeral; inspect again before acting. |
+| `list_windows` | none | Every top-level window owned by the simulator, including hidden windows and dialogs, with `hwnd`, title, class, visibility and rect. |
+| `inspect_ui` | `depth?` (1 to 14, default 7), `hwnd?` | Reads the native accessibility tree. Pass a dialog `hwnd` from `list_windows`; omit for the main window. The watch canvas is not exposed as native controls. |
+| `act_on_ui` | `path[]`, `action` (set, select, focus, AXPress, AXConfirm, AXIncrement, AXDecrement), `value?`, `hwnd?` | Acts on a freshly inspected element. Paths are ephemeral; inspect again before acting. |
+| `capture_window` | `hwnd`, `save_path?` | Captures a dialog or window owned by the simulator. Use for storage, login, time and phone-message dialogs. |
+| `close_window` | `hwnd` | Closes a simulator-owned dialog. Refuses to close the main window. |
 | `close_storage_editor` | none | Closes the persistent-storage editor and verifies it is gone. Safe when already closed. |
+
+### Debug channel and app state
+
+The channel is outbound only: the watch app polls `http://127.0.0.1:8799` and posts results back. No focus, no synthetic input, no inbound listener.
+
+Prerequisites: the app is compiled with `DEBUG_CHANNEL_ENABLED = true` (`source/debug/DebugConfig.mc`), and the simulator has **Simulation > Use Device HTTPS Requirements** disabled. Override the port with `CIQ_DEBUG_PORT`.
+
+| Tool | Parameters | Behaviour |
+|---|---|---|
+| `debug_status` | none | Endpoint, queued and pending commands, last poll age, last result. A null poll timestamp means no app has polled yet. |
+| `debug_ping` | `timeout_ms?` (10000) | Round-trips `ping`. Proves the app is running and polling. |
+| `state_read` | `keys?`, `timeout_ms?` | Storage keys and app properties. Requested keys are sent to the app, so per-deck and other custom keys are readable. `prop:` prefixes property values; arrays and dictionaries report size, long strings report length. |
+| `state_seed` | `values` (scalar, string array, or flat object), `verify?` (true), `timeout_ms?` | Writes storage with the correct shape: `premium` expects `{ active, code }`, `deck_list` expects an array of ids, other arrays become string arrays, and objects become string maps. Reads back and compares shape and contents. `null` deletes a key. App properties are rejected. |
+| `state_reset` | `verify?` (true), `timeout_ms?` | Clears every storage key through `Storage.clearValues()`. Restart the app for a clean first launch. |
+| `set_time` | `offset_seconds?`, `iso?`, `clear?`, `timeout_ms?` | Stores a clock offset used by `DebugClock` in SRS and date code. Does not change the simulator clock. |
+| `reset_state` | `scope?` (app, all_apps, simulator), `confirm` (true), `snapshot?`, `snapshot_dir?`, `verify?`, `wait_ms?`, `stop_app?` (true) | For app scope, clears storage through the debug channel and then kills the app so cached writes cannot restore it; returns `resetVia: "debug-channel"`. Other scopes use the simulator menu. Snapshots APPS and captures a before image first, and detects a confirmation dialog instead of guessing. |
+| `debug_command` | `verb`, `args?`, `timeout_ms?` | Raw channel escape hatch. Verbs: `ping`, `state`, `seed`, `reset`, `time`. |
+
+Storage values are app-specific. The reference app uses `onboarding_complete`, `premium`, `deck_list`, `stats`, `settings` and `active_deck_id`; its properties are `daily_goal`, `reveal_behavior`, `auto_advance`, `card_order`, `premium_enabled` and `deck_data`.
+
+### Device matrix and calibration
+
+| Tool | Parameters | Behaviour |
+|---|---|---|
+| `matrix_run` | `project_dir`, `devices[]`, `baseline_dir?`, `output_dir?`, `update_baselines?`, `wait_ms?`, `settle_ms?`, `threshold?`, `jungle_file?`, `developer_key_path?`, `debug_channel?` (true), `reset_before_each?` (true) | Builds and runs each device in turn, clears app storage and stops the previous app before each device, waits for a stable frame, captures at device resolution, and compares with `.ciq/baselines/<device>.png`. Creates missing baselines. No input or focus. |
+| `matrix_diff` | `baseline_dir`, `output_dir?`, `threshold?` | Compares every baseline PNG with its current counterpart. Returns matched, differing and missing counts plus changed percentage and bounds. |
+| `calibrate` | `device_id?`, `save_path?` | Window rect, client size, content offset, scale, bezel, display box, and every button centre mapped to window coordinates with an inside-window check. Geometry only; use a baseline for visual proof. |
+
+Matrix runs are sequential because one simulator and one device are active at a time. Each device switches the simulator, so expect a window resize between captures. Input steps are not part of `matrix_run`; run `press_button` separately when the desktop is unlocked.
 
 ### App file snapshots
 
@@ -123,6 +173,7 @@ Snapshot scope: 1 to 8 uppercase PRG basenames without extensions or separators,
 - `run_unit_tests` must see a full passing table. Incomplete output is not a pass.
 - OCR and screenshot diffs are evidence, not functional proof.
 - Do not use `force: true` on `terminate_simulator` while an app is writing storage unless you accept the risk.
+- `list_windows`, `capture_window`, `close_window` and `reset_state` use the Windows bridge; the macOS bridge still covers the main window only.
 
 ## Client configuration
 

@@ -16,9 +16,21 @@ export async function testingResult(action: () => Promise<unknown>): Promise<{ c
   }
 }
 
-export const inspectUI = (depth: number) => runBridgeCommand(["ui-tree", String(depth)]);
-export const actOnUI = (route: number[], action: string, value?: string) =>
-  runBridgeCommand(["ui-action", route.join("."), action, ...(value === undefined ? [] : [value])]);
+export const inspectUI = (depth: number, hwnd?: number) =>
+  runBridgeCommand(["ui-tree", String(depth), ...(hwnd ? ["--hwnd", String(hwnd)] : [])]);
+export const actOnUI = (
+  route: number[],
+  action: string,
+  value?: string,
+  hwnd?: number
+) =>
+  runBridgeCommand([
+    "ui-action",
+    route.join("."),
+    action,
+    ...(value === undefined ? [] : [value]),
+    ...(hwnd ? ["--hwnd", String(hwnd)] : []),
+  ]);
 
 const storageRoot = () => path.join(process.platform === "darwin"
   ? execFileSync("getconf", ["DARWIN_USER_TEMP_DIR"], { encoding: "utf8" }).trim() : os.tmpdir(),

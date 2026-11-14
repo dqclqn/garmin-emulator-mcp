@@ -26,9 +26,12 @@ Watch apps are awkward to test. The screen is tiny, there is no keyboard, and th
 | :--- | :--- |
 | Build | Compiles a Monkey C project with the Garmin SDK and loads it into the simulator. |
 | Drive | Presses the physical buttons, taps, swipes and long-presses the watch screen. |
+| Isolate | Runs the simulator on a hidden desktop, so it never takes over your screen. |
 | Inspect | Screenshots of the watch display, the bezel, or an annotated debug view. |
 | Read | App logs and crash output streamed back to the agent. |
 | Check | SDK, device profiles, signing key and simulator state before every run. |
+| State | Reads and seeds app storage, resets data and moves the app clock. |
+| Coverage | Builds and captures the same screen on several devices at once. |
 
 ## The loop
 
@@ -48,7 +51,7 @@ Watch apps are awkward to test. The screen is tiny, there is no keyboard, and th
 | Java | Runs the Garmin compiler. |
 | Connect IQ SDK Manager | Provides the SDK, simulator and device profiles. |
 | A developer signing key | Signs your app for the simulator. |
-| macOS 13 or Windows with PowerShell 5.1 | Supported hosts. Windows needs an unlocked desktop for button input. |
+| macOS 13 or Windows with PowerShell 5.1 | Supported hosts. Windows uses a hidden desktop by default; an unlocked desktop is only needed for the visible fallback. |
 
 ## Quick start
 
