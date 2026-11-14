@@ -7,7 +7,7 @@ import { locateGarminSdk } from "../config/sdk-locator.js";
 import { getWindowInfo, runBridgeCommand } from "../simulator/bridge.js";
 import { processManager } from "../simulator/process-manager.js";
 import { appDataDir, lockPath, logsDir } from "../session/session.js";
-import type { McpToolContent } from "./shared.js";
+import { structuredResult, type McpToolContent } from "./shared.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -96,6 +96,28 @@ export async function handleDoctor(args?: { project_dir?: string }): Promise<{
     } else {
       add("devices", "fail", `Missing devices directory ${sdkPaths.devicesDir}`);
     }
+
+    if (args?.project_dir) {
+      const manifestPath = path.join(path.resolve(args.project_dir), "manifest.xml");
+      try {
+        const manifest = fs.readFileSync(manifestPath, "utf-8");
+        const products = [...manifest.matchAll(/<iq:product\s+id="([^"]+)"/g)].map((match) => match[1]);
+        const missing = products.filter(
+          (product) => !fs.existsSync(path.join(sdkPaths!.devicesDir, product, "simulator.json"))
+        );
+        add(
+          "manifest.products",
+          missing.length === 0 ? "pass" : "fail",
+          missing.length === 0
+            ? `All ${products.length} manifest products have installed profiles`
+            : `Missing profiles for ${missing.join(", ")}`
+        );
+      } catch (error: any) {
+        add("manifest.products", "warn", `Could not read ${manifestPath}: ${error?.message || error}`);
+      }
+    } else {
+      add("manifest.products", "warn", "Pass project_dir to cross-check manifest products against installed profiles");
+    }
   }
 
   const javaVersion = await runVersion("java", ["-version"]);
@@ -112,11 +134,21 @@ export async function handleDoctor(args?: { project_dir?: string }): Promise<{
       "-Command",
       "$PSVersionTable.PSVersion.ToString()"
     ]);
-    add(
-      "powershell",
-      psVersion ? "pass" : "fail",
-      psVersion ?? "Windows PowerShell not found"
-    );
+    if (!psVersion) {
+      add("powershell", "fail", "Windows PowerShell not found");
+    } else {
+      const match = psVersion.match(/(\d+)\.(\d+)/);
+      const major = match ? Number(match[1]) : 0;
+      const minor = match ? Number(match[2]) : 0;
+      const supported = major > 5 || (major === 5 && minor >= 1);
+      add(
+        "powershell",
+        supported ? "pass" : "fail",
+        supported
+          ? psVersion
+          : `PowerShell ${psVersion} is too old; 5.1 or newer is required`
+      );
+    }
   }
 
   const key = findDeveloperKey(args?.project_dir);
@@ -197,22 +229,13 @@ export async function handleDoctor(args?: { project_dir?: string }): Promise<{
     fail: checks.filter((check) => check.status === "fail").length
   };
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(
-          {
-            ok: summary.fail === 0,
-            summary,
-            checks,
-            logsDir: logsDir()
-          },
-          null,
-          2
-        )
-      }
-    ],
-    isError: summary.fail > 0
-  };
+  return structuredResult(
+    {
+      ok: summary.fail === 0,
+      summary,
+      checks,
+      logsDir: logsDir(),
+    },
+    { isError: summary.fail > 0 }
+  );
 }

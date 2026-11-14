@@ -43,6 +43,43 @@ export function lockPath(): string {
   return path.join(appDataDir(), "session.lock");
 }
 
+export function sessionStatePath(): string {
+  return path.join(appDataDir(), "session-state.json");
+}
+
+export interface PersistedSessionState {
+  sessionId: string;
+  updatedAt: string;
+  running: boolean;
+  simulatorPid?: number;
+  desktop?: string;
+  windowId?: number;
+  adoptedFrom?: string;
+}
+
+export function readPersistedSession(): PersistedSessionState | undefined {
+  try {
+    const state = JSON.parse(fs.readFileSync(sessionStatePath(), "utf-8")) as PersistedSessionState;
+    return state && typeof state === "object" ? state : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writePersistedSession(state: Omit<PersistedSessionState, "updatedAt">): void {
+  ensureDir(appDataDir());
+  const payload: PersistedSessionState = { ...state, updatedAt: new Date().toISOString() };
+  fs.writeFileSync(sessionStatePath(), JSON.stringify(payload, null, 2));
+}
+
+export function clearPersistedSession(): void {
+  try {
+    fs.unlinkSync(sessionStatePath());
+  } catch {
+    // No persisted session.
+  }
+}
+
 interface LockOwner {
   pid: number;
   sessionId: string;

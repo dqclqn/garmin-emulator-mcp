@@ -14,6 +14,7 @@ import {
   handleRunUnitTests,
   handleSetActiveDevice,
   handleSimulatorStatus,
+  handleSessionStart,
   handleStopApp,
 } from "./tools/lifecycle.js";
 import {
@@ -41,6 +42,7 @@ import {
 import { handleCalibrate, handleMatrixDiff, handleMatrixRun } from "./tools/matrix.js";
 import { handleResetState } from "./tools/state.js";
 import { handlePhoneMessage } from "./tools/phone.js";
+import { handleDevLoop } from "./tools/dev-loop.js";
 import {
   handleDebugCommand,
   handleDebugPing,
@@ -53,6 +55,7 @@ import {
 import { handleDiff, handleWaitForStable } from "./tools/observation.js";
 import { placeSimulatorWindow } from "./simulator/bridge.js";
 import { killIsolatedSimulatorSync, terminateIsolatedSimulator } from "./simulator/isolated.js";
+import { clearPersistedSession } from "./session/session.js";
 import { acquireSessionLock, releaseSessionLock, sessionId } from "./session/session.js";
 
 /**
@@ -81,9 +84,45 @@ export function createServer(): McpServer {
     version: "0.1.0",
   });
 
+  // Every tool that returns a JSON text block also exposes the same object as
+  // MCP structured content. Tools may still set structuredContent explicitly.
+  const originalTool = (server as any).tool.bind(server);
+  (server as any).tool = (...args: any[]) => {
+    const handler = args[args.length - 1];
+    if (typeof handler === "function") {
+      args[args.length - 1] = async (...handlerArgs: any[]) => {
+        const result = await handler(...handlerArgs);
+        if (result && Array.isArray(result.content) && result.structuredContent === undefined) {
+          const text = result.content.find((item: any) => item?.type === "text")?.text;
+          if (typeof text === "string" && text.trim().startsWith("{")) {
+            try {
+              const parsed = JSON.parse(text);
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                result.structuredContent = parsed;
+              }
+            } catch {
+              // Prose and non-JSON text stay as text only.
+            }
+          }
+        }
+        return result;
+      };
+    }
+    return originalTool(...args);
+  };
+
   // ==========================================
   // Lifecycle Tools
   // ==========================================
+
+  server.tool(
+    "session_start",
+    "Report whether this server adopted a simulator left by an earlier session or started clean. Use reset: true to terminate the adopted simulator and clear the stored session.",
+    {
+      reset: z.boolean().optional().describe("Terminate the adopted simulator and clear session state (default: false)"),
+    },
+    async (args) => handleSessionStart(args)
+  );
 
   server.tool(
     "simulator_status",
@@ -144,6 +183,22 @@ export function createServer(): McpServer {
   );
 
   server.tool(
+    "dev_loop",
+    "Build the project, run it, capture the first stable frame and return the latest log lines in one call.",
+    {
+      project_dir: z.string().describe("Monkey C project directory"),
+      device_id: z.string().optional().describe("Device id (defaults to active device)"),
+      debug_channel: z.boolean().optional().describe("Build with the debug automation channel (default: true)"),
+      wait_ms: z.number().optional().describe("Monkeydo startup wait (default: 2500)"),
+      settle_ms: z.number().optional().describe("Reserved settle time for future frame selection"),
+      log_lines: z.number().optional().describe("Log lines to return (default: 40)"),
+      jungle_file: z.string().optional().describe("Explicit jungle file"),
+      developer_key_path: z.string().optional().describe("Explicit developer key"),
+    },
+    async (args) => handleDevLoop(args)
+  );
+
+  server.tool(
     "build_app",
     "Build a Monkey C project for a specified device using the SDK monkeyc compiler.",
     {
@@ -184,6 +239,10 @@ export function createServer(): McpServer {
         .describe(
           "Swap in the debug automation config before building (default: true). Set false for a release build with the channel disabled."
         ),
+      timeout_ms: z
+        .number()
+        .optional()
+        .describe("Hard build deadline; monkeyc is killed with E_TIMEOUT"),
     },
     async (args) => handleBuildApp(args)
   );
@@ -215,6 +274,10 @@ export function createServer(): McpServer {
         .number()
         .optional()
         .describe("Maximum wait for a stable frame and startup log marker (default: 8000)"),
+      timeout_ms: z
+        .number()
+        .optional()
+        .describe("Hard startup deadline that kills monkeydo with E_TIMEOUT"),
     },
     async (args) => handleRunApp(args)
   );
@@ -305,6 +368,10 @@ export function createServer(): McpServer {
     "press_button_sequence",
     "Execute a sequence of button presses in order with configurable delays, capturing the final watch screen.",
     {
+      isolated: z
+        .boolean()
+        .optional()
+        .describe("Launch on a hidden desktop when the simulator is not running (default: true on Windows)"),
       steps: z
         .array(
           z.object({
@@ -507,7 +574,36 @@ export function createServer(): McpServer {
       save_path: z
         .string()
         .optional()
-        .describe("Optional file path on disk to save the PNG image"),
+        .describe("Optional file path on disk to save the image"),
+      format: z
+        .enum(["png", "webp"])
+        .optional()
+        .describe("Output format (default: png)"),
+      hash_only: z
+        .boolean()
+        .optional()
+        .describe("Return the hash and metadata without the image payload"),
+      region: z
+        .object({
+          x: z.number(),
+          y: z.number(),
+          width: z.number(),
+          height: z.number(),
+        })
+        .optional()
+        .describe("Crop region in processed screenshot pixels"),
+      mask: z
+        .enum(["round", "none"])
+        .optional()
+        .describe("Mask the screen view to a circle (round devices)"),
+      inline_ocr: z
+        .boolean()
+        .optional()
+        .describe("Run OCR on the captured image and include the text"),
+      expect_text: z
+        .string()
+        .optional()
+        .describe("Fail with E_TEXT_NOT_FOUND unless the OCR text contains this value"),
     },
     async (args) => handleGetScreenshot(args)
   );
@@ -618,6 +714,7 @@ export function createServer(): McpServer {
     async ({ force }) => {
       try {
         const result = await terminateIsolatedSimulator(force);
+        clearPersistedSession();
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (error) {
         return {
@@ -798,9 +895,11 @@ export function createServer(): McpServer {
 
   server.tool(
     "list_windows",
-    "List every top-level window owned by the simulator, including storage, login, time and phone-message dialogs. Use the hwnd with inspect_ui, capture_window or act_on_ui.",
-    {},
-    async () => handleListWindows()
+    "List top-level simulator windows, including storage, login, time and phone-message dialogs. IME and hidden wx windows are filtered unless include_hidden is true.",
+    {
+      include_hidden: z.boolean().optional().describe("Include IME, tooltip and hidden wx windows (default: false)"),
+    },
+    async (args) => handleListWindows(args)
   );
 
   server.tool(
@@ -849,7 +948,7 @@ export function createServer(): McpServer {
 
   server.tool(
     "matrix_run",
-    "Build, run and capture one screen per device, then compare each against .ciq/baselines. Creates baselines when missing or when update_baselines is true. No input or focus required.",
+    "Build, run and capture one screen per device, optionally run a button/touch scenario, and compare each step against .ciq/baselines. Creates baselines when missing or when update_baselines is true.",
     {
       project_dir: z.string().describe("Monkey C project directory"),
       devices: z.array(z.string()).min(1).describe("Device ids from list_devices"),
@@ -869,6 +968,28 @@ export function createServer(): McpServer {
         .boolean()
         .optional()
         .describe("Clear app storage and stop the app before each device (default: true)"),
+      isolated: z
+        .boolean()
+        .optional()
+        .describe("Launch on a hidden desktop when the simulator is not running (default: true on Windows)"),
+      steps: z
+        .array(
+          z.object({
+            name: z.string().optional(),
+            action: z.enum(["button", "tap", "swipe", "hold", "wait"]),
+            button: z.string().optional(),
+            hold: z.boolean().optional(),
+            hold_ms: z.number().optional(),
+            x: z.number().optional(),
+            y: z.number().optional(),
+            direction: z.enum(["up", "down", "left", "right"]).optional(),
+            duration_ms: z.number().optional(),
+            expect: z.enum(["change", "noop"]).optional(),
+          })
+        )
+        .max(20)
+        .optional()
+        .describe("Optional input scenario run after the first capture, with a baseline per step"),
     },
     async (args) => handleMatrixRun(args)
   );
@@ -890,6 +1011,8 @@ export function createServer(): McpServer {
     {
       device_id: z.string().optional().describe("Device id (defaults to active device)"),
       save_path: z.string().optional().describe("Optional file path for a raw simulator screenshot"),
+      verify: z.boolean().optional().describe("Tap a grid and report changed pixels at each point"),
+      grid: z.number().int().min(2).max(5).optional().describe("Grid size per axis for verify (default: 3)"),
     },
     async (args) => handleCalibrate(args)
   );

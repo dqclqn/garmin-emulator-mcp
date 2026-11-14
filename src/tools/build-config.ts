@@ -10,7 +10,8 @@ import path from "node:path";
  */
 export async function applyDebugConfig(
   projectDir: string,
-  enabled: boolean
+  enabled: boolean,
+  options?: { port?: number; token?: string }
 ): Promise<() => Promise<void>> {
   const configPath = path.join(projectDir, "source", "debug", "DebugConfig.mc");
   const templatePath = path.join(
@@ -24,11 +25,12 @@ export async function applyDebugConfig(
   }
 
   const original = await fs.promises.readFile(configPath);
-  if (enabled) {
-    await fs.promises.copyFile(templatePath, configPath);
-  } else {
-    await fs.promises.writeFile(configPath, await fs.promises.readFile(templatePath));
-  }
+  const port = options?.port ?? Number(process.env.CIQ_DEBUG_PORT ?? 8799);
+  const token = options?.token ?? process.env.CIQ_DEBUG_TOKEN ?? "ciq-local-token";
+  const template = (await fs.promises.readFile(templatePath, "utf-8"))
+    .replace(/__CIQ_DEBUG_PORT__/g, String(Number.isFinite(port) && port > 0 ? port : 8799))
+    .replace(/__CIQ_DEBUG_TOKEN__/g, token.replace(/["\\]/g, ""));
+  await fs.promises.writeFile(configPath, template, "utf-8");
 
   return async () => {
     try {

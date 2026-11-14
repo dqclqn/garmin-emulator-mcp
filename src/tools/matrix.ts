@@ -6,11 +6,26 @@ import { processManager } from "../simulator/process-manager.js";
 import { getWindowInfo, captureRawWindowPng } from "../simulator/bridge.js";
 import { captureScreen, diffPngBuffers } from "../simulator/receipts.js";
 import { runDebugCommand } from "../debug/channel.js";
-import { formatScreenshotResult, resolveActiveDeviceProfile, type McpToolContent } from "./shared.js";
+import { formatScreenshotResult, resolveActiveDeviceProfile, structuredResult, type McpToolContent } from "./shared.js";
 import { applyDebugConfig } from "./build-config.js";
+import { launchIsolatedSimulator } from "../simulator/isolated.js";
 import { getActiveDeviceId } from "./shared.js";
+import { handleHoldScreen, handlePressButton, handleSwipeScreen, handleTapScreen } from "./navigation.js";
 
 type ToolResponse = { content: McpToolContent[]; isError?: boolean };
+
+export interface MatrixStep {
+  name?: string;
+  action: "button" | "tap" | "swipe" | "hold" | "wait";
+  button?: string;
+  hold?: boolean;
+  hold_ms?: number;
+  x?: number;
+  y?: number;
+  direction?: "up" | "down" | "left" | "right";
+  duration_ms?: number;
+  expect?: "change" | "noop";
+}
 
 function text(value: unknown): ToolResponse {
   return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
@@ -33,6 +48,8 @@ export async function handleMatrixRun(args: {
   developer_key_path?: string;
   debug_channel?: boolean;
   reset_before_each?: boolean;
+  isolated?: boolean;
+  steps?: MatrixStep[];
 }): Promise<ToolResponse> {
   let restoreConfig: (() => Promise<void>) | undefined;
   try {
@@ -41,6 +58,9 @@ export async function handleMatrixRun(args: {
     }
     if (!args.devices || args.devices.length === 0) {
       return failure("Pass at least one device id.");
+    }
+    if (args.steps && args.steps.length > 20) {
+      return failure("A matrix scenario supports at most 20 steps.");
     }
 
     const sdk = locateGarminSdk();
@@ -53,9 +73,18 @@ export async function handleMatrixRun(args: {
 
     const infoBefore = await getWindowInfo();
     if (!infoBefore.running) {
-      const launch = await processManager.launchSimulatorApp(sdk, 20000);
-      if (!launch.ready) {
-        return failure("The simulator did not become ready.");
+      if (process.platform === "win32" && args.isolated !== false) {
+        const profile = resolveActiveDeviceProfile(getActiveDeviceId());
+        await launchIsolatedSimulator({
+          simulatorPath: sdk.simulatorAppPath,
+          expectedClientWidth: profile.bezelDimensions?.width,
+          waitMs: 25000,
+        });
+      } else {
+        const launch = await processManager.launchSimulatorApp(sdk, 20000);
+        if (!launch.ready) {
+          return failure("The simulator did not become ready.");
+        }
       }
     }
 
@@ -182,11 +211,126 @@ export async function handleMatrixRun(args: {
         };
       }
 
+      if (args.steps && args.steps.length > 0) {
+        const stepResults: Array<Record<string, unknown>> = [];
+        for (let index = 0; index < args.steps.length; index++) {
+          const step = args.steps[index];
+          const name = step.name ?? `step-${String(index + 1).padStart(2, "0")}`;
+          const slug = name.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-|-$/g, "") || `step-${index + 1}`;
+          const stepEntry: Record<string, unknown> = { index, name, action: step.action };
+
+          if (step.action === "wait") {
+            await new Promise((resolve) => setTimeout(resolve, step.duration_ms ?? 500));
+            stepEntry.ok = true;
+          } else {
+            let response: ToolResponse | undefined;
+            try {
+              if (step.action === "button") {
+                if (!step.button) throw new Error("button steps need a button name");
+                response = await handlePressButton({
+                  button: step.button,
+                  hold: step.hold,
+                  hold_ms: step.hold_ms,
+                  device_id: deviceId,
+                  capture_after: false,
+                  expect: step.expect ?? "change",
+                  settle_ms: args.settle_ms ?? 700,
+                });
+              } else if (step.action === "tap") {
+                if (step.x === undefined || step.y === undefined) throw new Error("tap steps need x and y");
+                response = await handleTapScreen({
+                  x: step.x,
+                  y: step.y,
+                  device_id: deviceId,
+                  capture_after: false,
+                  expect: step.expect,
+                  settle_ms: args.settle_ms ?? 700,
+                });
+              } else if (step.action === "hold") {
+                if (step.x === undefined || step.y === undefined) throw new Error("hold steps need x and y");
+                response = await handleHoldScreen({
+                  x: step.x,
+                  y: step.y,
+                  duration_ms: step.duration_ms,
+                  device_id: deviceId,
+                  capture_after: false,
+                  expect: step.expect,
+                  settle_ms: args.settle_ms ?? 700,
+                });
+              } else {
+                if (!step.direction) throw new Error("swipe steps need a direction");
+                response = await handleSwipeScreen({
+                  direction: step.direction,
+                  device_id: deviceId,
+                  capture_after: false,
+                  expect: step.expect,
+                  settle_ms: args.settle_ms ?? 700,
+                });
+              }
+            } catch (error) {
+              stepEntry.ok = false;
+              stepEntry.error = error instanceof Error ? error.message : String(error);
+            }
+            if (response) {
+              stepEntry.ok = !response.isError;
+              stepEntry.details = response.content
+                .filter((item) => item.type === "text")
+                .map((item) => (item as { text: string }).text)
+                .join("\n")
+                .slice(0, 800);
+            }
+          }
+
+          if (stepEntry.ok !== false) {
+            const stepSnapshot = await captureScreen();
+            const stepPath = path.join(outputDir, `${deviceId}-${slug}.png`);
+            const formattedStep = await formatScreenshotResult({
+              rawWindowPng: stepSnapshot.buffer,
+              windowInfo: stepSnapshot.windowInfo,
+              view: "screen",
+              deviceId,
+              savePath: stepPath,
+            });
+            const stepBaselinePath = path.join(baselineDir, `${deviceId}-${slug}.png`);
+            const stepBuffer = await fs.promises.readFile(stepPath);
+            let stepBaseline: Record<string, unknown>;
+            if (args.update_baselines === true || !fs.existsSync(stepBaselinePath)) {
+              await fs.promises.writeFile(stepBaselinePath, stepBuffer);
+              stepBaseline = { path: stepBaselinePath, status: "written" };
+            } else {
+              const diff = await diffPngBuffers(
+                await fs.promises.readFile(stepBaselinePath),
+                stepBuffer,
+                args.threshold ?? 12
+              );
+              stepBaseline = {
+                path: stepBaselinePath,
+                status: diff.changedPixels > 0 ? "differs" : "matches",
+                changedPercent: diff.changedPct,
+                changedPixels: diff.changedPixels,
+                bounds: diff.bounds,
+              };
+            }
+            stepEntry.capture = {
+              path: stepPath,
+              width: formattedStep.screenshot.width,
+              height: formattedStep.screenshot.height,
+              baseline: stepBaseline,
+            };
+          }
+          stepResults.push(stepEntry);
+        }
+        entry.steps = stepResults;
+      }
+
       report.push(entry);
     }
 
     const failed = report.filter(
-      (entry) => (entry.build as any)?.success === false || (entry.run as any)?.launched === false
+      (entry) =>
+        (entry.build as any)?.success === false ||
+        (entry.run as any)?.launched === false ||
+        (Array.isArray(entry.steps) && (entry.steps as any[]).some((step) => step.ok === false))
     ).length;
 
     return text({
@@ -258,6 +402,8 @@ export async function handleMatrixDiff(args: {
 export async function handleCalibrate(args?: {
   device_id?: string;
   save_path?: string;
+  verify?: boolean;
+  grid?: number;
 }): Promise<ToolResponse> {
   try {
     const deviceId = getActiveDeviceId(args?.device_id);
@@ -325,6 +471,53 @@ export async function handleCalibrate(args?: {
       await fs.promises.writeFile(target, raw);
       const metadata = await sharp(raw).metadata();
       result.saved = { path: target, width: metadata.width, height: metadata.height };
+    }
+
+    if (args?.verify === true) {
+      if (!profile.display.isTouch) {
+        result.verification = {
+          method: "tap-grid-visual",
+          skipped: "The active device has no touch screen.",
+        };
+      } else {
+        const grid = Math.max(2, Math.min(args.grid ?? 3, 5));
+        const points: Array<Record<string, unknown>> = [];
+        for (let row = 0; row < grid; row++) {
+          for (let column = 0; column < grid; column++) {
+            const x = (column + 0.5) / grid;
+            const y = (row + 0.5) / grid;
+            const before = await captureScreen();
+            await handleTapScreen({
+              x,
+              y,
+              normalized: true,
+              device_id: deviceId,
+              capture_after: false,
+              settle_ms: 250,
+            });
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            const after = await captureScreen();
+            const diff = await diffPngBuffers(before.buffer, after.buffer, 12);
+            points.push({
+              column,
+              row,
+              normalized: { x: Math.round(x * 1000) / 1000, y: Math.round(y * 1000) / 1000 },
+              changedPct: diff.changedPct,
+              changedPixels: diff.changedPixels,
+              bounds: diff.bounds,
+            });
+          }
+        }
+        result.verification = {
+          method: "tap-grid-visual",
+          grid,
+          points,
+          changedPoints: points.filter((point) => (point.changedPixels as number) > 0).length,
+          anyChange: points.some((point) => (point.changedPixels as number) > 0),
+          note:
+            "Each grid point is tapped through the same coordinate mapping as tap_screen. A changed screen proves the tap reached the app; a blank point proves only that the screen did not change.",
+        };
+      }
     }
 
     return text(result);

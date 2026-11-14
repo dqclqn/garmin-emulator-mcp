@@ -32,7 +32,8 @@ Watch apps are awkward to test. The screen is tiny, there is no keyboard, and th
 | Check | SDK, device profiles, signing key and simulator state before every run. |
 | State | Reads and seeds app storage and debug property overrides, resets data and moves the app clock. |
 | Message | Sends a phone-app message into the app and reads the stored payload back. |
-| Coverage | Builds and captures the same screen on several devices at once. |
+| Coverage | Builds and captures the same screen, and optional button or touch steps, across several devices. |
+| Loop | Builds, runs and returns the first frame and log tail in one call. |
 
 ## The loop
 
@@ -63,6 +64,8 @@ Watch apps are awkward to test. The screen is tiny, there is no keyboard, and th
 | Connect | Point your MCP client at `dist/index.js`. |
 
 Ask the agent to check the setup, launch the simulator, build your project and take a screenshot. Setup examples for common clients are in [AGENT-README.md](AGENT-README.md).
+
+`npm install` can print install-script warnings from `sharp`, `esbuild` or `fsevents`. They are dependency build messages, not server errors; `npm run build` is the check that matters.
 
 ## Good to know
 

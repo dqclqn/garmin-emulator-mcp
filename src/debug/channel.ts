@@ -1,5 +1,7 @@
 import http from "node:http";
+import fs from "node:fs";
 import { URL } from "node:url";
+import { sessionLogPath } from "../session/session.js";
 
 export interface DebugResult {
   id: string;
@@ -20,6 +22,20 @@ interface PendingCommand {
 }
 
 const DEFAULT_PORT = 8799;
+const DEBUG_TOKEN = process.env.CIQ_DEBUG_TOKEN ?? "ciq-local-token";
+let commandLogCount = 0;
+
+function logDebug(message: string): void {
+  commandLogCount += 1;
+  try {
+    fs.appendFileSync(
+      sessionLogPath(),
+      `${new Date().toISOString()}\t[debug] ${message}\n`
+    );
+  } catch {
+    // Command logging must never break the channel.
+  }
+}
 
 let server: http.Server | null = null;
 let queue: QueuedCommand[] = [];
@@ -79,9 +95,19 @@ export async function ensureDebugServer(): Promise<ReturnType<typeof status>> {
     }
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${port()}`);
 
+    if (url.pathname === "/poll" || url.pathname === "/result") {
+      if (req.headers["x-ciq-token"] !== DEBUG_TOKEN) {
+        sendText(res, 401, "unauthorized");
+        return;
+      }
+    }
+
     if (url.pathname === "/poll") {
       lastPollAt = Date.now();
       const next = queue.shift();
+      if (next) {
+        logDebug(`poll -> ${next.command}`);
+      }
       sendText(res, 200, next ? next.command : "none");
       return;
     }
@@ -95,6 +121,7 @@ export async function ensureDebugServer(): Promise<ReturnType<typeof status>> {
         at: Date.now(),
       };
       lastResult = result;
+      logDebug(`result ${id} ok=${result.ok} data=${result.data.slice(0, 120)}`);
       const waiting = pending.get(id);
       if (waiting) {
         clearTimeout(waiting.timer);

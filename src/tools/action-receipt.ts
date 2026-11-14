@@ -24,6 +24,7 @@ export interface RunWithReceiptResult<T> {
   receipt?: ScreenReceipt;
   content: McpToolContent[];
   focusPath?: string;
+  inputMode?: "focus" | "posted";
 }
 
 async function safeCapture(): Promise<ScreenSnapshot | undefined> {
@@ -78,6 +79,7 @@ export async function runWithReceipt<T>(
       receipt,
       content,
       focusPath: lease ? lease.path : "isolated-desktop",
+      inputMode: lease ? "focus" : "posted",
     };
   } finally {
     if (lease) {
@@ -98,7 +100,8 @@ export function receiptLine(receipt?: ScreenReceipt, focusPath?: string): string
     ? `, changed region ${receipt.bounds.width}x${receipt.bounds.height} at (${receipt.bounds.x}, ${receipt.bounds.y})`
     : "";
   const focus = focusPath ? `, focus ${focusPath}` : "";
-  return `Receipt: ${change}${bounds}, hash ${receipt.hashAfter.slice(0, 12)}, settle ${receipt.settleMs}ms${focus}.`;
+  const inputMode = focusPath === "isolated-desktop" ? "posted" : "focus";
+  return `Receipt: ${change}${bounds}, hash ${receipt.hashAfter.slice(0, 12)}, settle ${receipt.settleMs}ms, input ${inputMode}${focus}.`;
 }
 
 /**

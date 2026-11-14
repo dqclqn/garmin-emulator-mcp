@@ -97,4 +97,7 @@ export interface ProcessedScreenshot {
   view: ScreenshotViewMode;
   deviceId: string;
   savedPath?: string;
+  mimeType?: string;
+  format?: "png" | "webp";
+  hash?: string;
 }

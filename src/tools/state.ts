@@ -11,6 +11,7 @@ import type { McpToolContent } from "./shared.js";
 import { processManager } from "../simulator/process-manager.js";
 import { locateGarminSdk } from "../config/sdk-locator.js";
 import { waitForDebugChannel } from "../debug/readiness.js";
+import { ErrorCodes, codedError } from "../errors.js";
 
 type ToolResponse = { content: McpToolContent[]; isError?: boolean };
 
@@ -112,13 +113,13 @@ export async function handleResetState(args: {
   const scope = args.scope ?? "app";
   const menuId = RESET_MENU_IDS[scope];
   if (!menuId) {
-    return { content: [{ type: "text", text: `Unknown reset scope: ${scope}` }], isError: true };
+    return { content: [{ type: "text", text: codedError(ErrorCodes.UNSUPPORTED, `Unknown reset scope: ${scope}`) }], isError: true };
   }
 
   try {
     const info = await getWindowInfo();
     if (!info.running || !info.windowId) {
-      return { content: [{ type: "text", text: "The simulator is not running." }], isError: true };
+      return { content: [{ type: "text", text: codedError(ErrorCodes.SIMULATOR_NOT_RUNNING, "The simulator is not running.") }], isError: true };
     }
 
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -183,9 +184,9 @@ export async function handleResetState(args: {
             content: [
               {
                 type: "text",
-                text: `Refusing to reset without a snapshot: ${
+                text: codedError(ErrorCodes.SNAPSHOT_FAILED, `Refusing to reset without a snapshot: ${
                   error instanceof Error ? error.message : String(error)
-                }`,
+                }`),
               },
             ],
             isError: true,
@@ -238,7 +239,7 @@ export async function handleResetState(args: {
       const cleared = await runDebugCommand("reset", [], 8000);
       if (!cleared.ok) {
         return {
-          content: [{ type: "text", text: `Debug-channel reset failed: ${cleared.data}` }],
+          content: [{ type: "text", text: codedError(ErrorCodes.STATE_TIMEOUT, `Debug-channel reset failed: ${cleared.data}`) }],
           isError: true,
         };
       }
@@ -286,9 +287,9 @@ export async function handleResetState(args: {
           content: [
             {
               type: "text",
-              text: `Refusing to reset without a snapshot: ${
+              text: codedError(ErrorCodes.SNAPSHOT_FAILED, `Refusing to reset without a snapshot: ${
                 error instanceof Error ? error.message : String(error)
-              }`,
+              }`),
             },
           ],
           isError: true,

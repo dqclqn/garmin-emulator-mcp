@@ -112,6 +112,24 @@ export type McpToolContent =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
 
+export interface StructuredToolResult {
+  content: McpToolContent[];
+  structuredContent?: Record<string, unknown>;
+  isError?: boolean;
+}
+
+/** Returns the same JSON in a text block and MCP structured content. */
+export function structuredResult(
+  value: Record<string, unknown>,
+  options?: { isError?: boolean }
+): StructuredToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+    structuredContent: value,
+    isError: options?.isError,
+  };
+}
+
 /**
  * Formats an already captured window buffer into the requested view mode.
  * Lets input receipts reuse their "after" capture instead of capturing twice.
@@ -122,6 +140,10 @@ export async function formatScreenshotResult(options: {
   view?: ScreenshotViewMode;
   deviceId?: string;
   savePath?: string;
+  format?: "png" | "webp";
+  region?: { x: number; y: number; width: number; height: number };
+  mask?: "round" | "none";
+  hashOnly?: boolean;
 }): Promise<{
   screenshot: ProcessedScreenshot;
   mcpContent: McpToolContent[];
@@ -135,26 +157,32 @@ export async function formatScreenshotResult(options: {
     profile,
     view: options.view ?? "screen",
     savePath: options.savePath,
+    format: options.format,
+    region: options.region,
+    mask: options.mask,
   });
 
   const metadataText =
     `Garmin simulator screenshot captured [device: ${screenshot.deviceId}, ` +
-    `view: ${screenshot.view}, dimensions: ${screenshot.width}x${screenshot.height}px` +
+    `view: ${screenshot.view}, dimensions: ${screenshot.width}x${screenshot.height}px, ` +
+    `format: ${screenshot.format ?? "png"}, hash: ${screenshot.hash}` +
     `${screenshot.savedPath ? `, saved: ${screenshot.savedPath}` : ""}].`;
 
   return {
     screenshot,
-    mcpContent: [
-      {
-        type: "image",
-        data: screenshot.base64Png,
-        mimeType: "image/png",
-      },
-      {
-        type: "text",
-        text: metadataText,
-      },
-    ],
+    mcpContent: options.hashOnly
+      ? [{ type: "text", text: metadataText }]
+      : [
+          {
+            type: "image",
+            data: screenshot.base64Png,
+            mimeType: screenshot.mimeType ?? "image/png",
+          },
+          {
+            type: "text",
+            text: metadataText,
+          },
+        ],
   };
 }
 
@@ -167,6 +195,10 @@ export async function captureAndFormatScreenshot(options?: {
   view?: ScreenshotViewMode;
   deviceId?: string;
   savePath?: string;
+  format?: "png" | "webp";
+  region?: { x: number; y: number; width: number; height: number };
+  mask?: "round" | "none";
+  hashOnly?: boolean;
 }): Promise<{
   screenshot: ProcessedScreenshot;
   mcpContent: McpToolContent[];
@@ -187,5 +219,9 @@ export async function captureAndFormatScreenshot(options?: {
     view: options?.view,
     deviceId: options?.deviceId,
     savePath: options?.savePath,
+    format: options?.format,
+    region: options?.region,
+    mask: options?.mask,
+    hashOnly: options?.hashOnly,
   });
 }

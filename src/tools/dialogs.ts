@@ -11,7 +11,7 @@ import type { McpToolContent } from "./shared.js";
 
 type ToolResponse = { content: McpToolContent[]; isError?: boolean };
 
-export async function handleListWindows(): Promise<ToolResponse> {
+export async function handleListWindows(args?: { include_hidden?: boolean }): Promise<ToolResponse> {
   try {
     const info = await getWindowInfo();
     if (!info.running) {
@@ -24,7 +24,17 @@ export async function handleListWindows(): Promise<ToolResponse> {
     if (!result.ok) {
       return { content: [{ type: "text", text: result.error ?? "Unable to list windows." }], isError: true };
     }
-    const windows = (result.windows ?? []).map((window: any) => ({
+    const ignoredClasses = new Set([
+      "IME",
+      "MSCTFIME UI",
+      "Default IME",
+      "CiceroUIWndFrame",
+      "TF_FloatingLangBar_WndTitle",
+      "Tooltip",
+      "wxTimerHiddenWindow",
+      "wxDisplayHiddenWindow",
+    ]);
+    const all = (result.windows ?? []).map((window: any) => ({
       hwnd: window.hwnd,
       title: window.title,
       class: window.class,
@@ -32,11 +42,29 @@ export async function handleListWindows(): Promise<ToolResponse> {
       rect: window.rect,
       isMain: window.hwnd === info.windowId,
     }));
+    const windows = args?.include_hidden === true
+      ? all
+      : all.filter(
+          (window: any) =>
+            window.isMain ||
+            (window.visible !== false &&
+              !ignoredClasses.has(String(window.class ?? "")) &&
+              String(window.title ?? "").trim().length > 0)
+        );
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ mainWindowId: info.windowId, windows }, null, 2),
+          text: JSON.stringify(
+            {
+              mainWindowId: info.windowId,
+              windows,
+              filtered: all.length - windows.length,
+              includeHidden: args?.include_hidden === true,
+            },
+            null,
+            2
+          ),
         },
       ],
     };

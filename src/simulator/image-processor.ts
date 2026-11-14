@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import sharp from "sharp";
 import type {
   DeviceProfile,
@@ -128,6 +129,9 @@ export async function processSimulatorScreenshot(params: {
   profile: DeviceProfile;
   view: ScreenshotViewMode;
   savePath?: string;
+  format?: "png" | "webp";
+  region?: { x: number; y: number; width: number; height: number };
+  mask?: "round" | "none";
 }): Promise<ProcessedScreenshot> {
   const { rawWindowPng, windowBounds, profile, view, savePath } = params;
 
@@ -223,7 +227,36 @@ export async function processSimulatorScreenshot(params: {
     }
   }
 
-  // 4. Save to disk if requested
+  // 4. Optional region crop and round mask.
+  if (params.region) {
+    const left = Math.max(0, Math.min(Math.round(params.region.x), finalWidth - 1));
+    const top = Math.max(0, Math.min(Math.round(params.region.y), finalHeight - 1));
+    const width = Math.max(1, Math.min(Math.round(params.region.width), finalWidth - left));
+    const height = Math.max(1, Math.min(Math.round(params.region.height), finalHeight - top));
+    finalBuffer = await sharp(finalBuffer)
+      .extract({ left, top, width, height })
+      .png()
+      .toBuffer();
+    finalWidth = width;
+    finalHeight = height;
+  }
+
+  if (params.mask === "round" && view === "screen") {
+    const radius = Math.floor(Math.min(finalWidth, finalHeight) / 2) - 1;
+    const svg = `<svg width="${finalWidth}" height="${finalHeight}" xmlns="http://www.w3.org/2000/svg"><circle cx="${finalWidth / 2}" cy="${finalHeight / 2}" r="${radius}" fill="white"/></svg>`;
+    finalBuffer = await sharp(finalBuffer)
+      .ensureAlpha()
+      .composite([{ input: Buffer.from(svg), blend: "dest-in" }])
+      .png()
+      .toBuffer();
+  }
+
+  const format = params.format ?? "png";
+  if (format === "webp") {
+    finalBuffer = await sharp(finalBuffer).webp({ lossless: true }).toBuffer();
+  }
+
+  // 5. Save to disk if requested
   if (savePath) {
     const parentDir = path.dirname(savePath);
     await fs.promises.mkdir(parentDir, { recursive: true });
@@ -236,6 +269,9 @@ export async function processSimulatorScreenshot(params: {
     height: finalHeight,
     view,
     deviceId: profile.deviceId,
-    savedPath: savePath
+    savedPath: savePath,
+    mimeType: format === "webp" ? "image/webp" : "image/png",
+    format,
+    hash: crypto.createHash("sha256").update(finalBuffer).digest("hex"),
   };
 }

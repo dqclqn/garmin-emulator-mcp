@@ -25,6 +25,7 @@ export interface BuildProjectOptions {
   developerKeyPath?: string;
   outputPrgPath?: string;
   extraArgs?: string[];
+  timeoutMs?: number;
 }
 
 export interface BuildResult {
@@ -40,6 +41,7 @@ export interface RunAppOptions {
   prgPath: string;
   deviceId: string;
   waitMs?: number;
+  timeoutMs?: number;
 }
 
 export interface RunAppResult {
@@ -510,6 +512,13 @@ export class SimulatorProcessManager {
 
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
+      let buildTimedOut = false;
+      const buildTimeout = options.timeoutMs && options.timeoutMs > 0
+        ? setTimeout(() => {
+            buildTimedOut = true;
+            try { child.kill("SIGKILL"); } catch { /* already gone */ }
+          }, options.timeoutMs)
+        : undefined;
 
       child.stdout?.on("data", (chunk: Buffer) => {
         stdoutChunks.push(chunk);
@@ -522,6 +531,7 @@ export class SimulatorProcessManager {
       });
 
       child.on("error", (err: Error) => {
+        if (buildTimeout) clearTimeout(buildTimeout);
         const errorMsg = `Error executing monkeyc: ${err.message}`;
         this.appendLog("stderr", errorMsg);
         this.lastBuildPath = path.resolve(outputPrgPath);
@@ -536,10 +546,14 @@ export class SimulatorProcessManager {
       });
 
       child.on("close", async (code: number | null) => {
+        if (buildTimeout) clearTimeout(buildTimeout);
         const exitCode = code ?? -1;
         const stdoutStr = Buffer.concat(stdoutChunks).toString("utf-8");
-        const stderrStr = Buffer.concat(stderrChunks).toString("utf-8");
-        const success = exitCode === 0;
+        const stderrRaw = Buffer.concat(stderrChunks).toString("utf-8");
+        const stderrStr = buildTimedOut
+          ? `${stderrRaw}\nE_TIMEOUT: build exceeded ${options.timeoutMs}ms`
+          : stderrRaw;
+        const success = exitCode === 0 && !buildTimedOut;
         const prgHash = success ? await this.hashPrg(outputPrgPath) : undefined;
 
         this.lastBuildPath = path.resolve(outputPrgPath);
@@ -707,6 +721,9 @@ export class SimulatorProcessManager {
           if (waitTimer) {
             clearTimeout(waitTimer);
           }
+          if (hardTimeout) {
+            clearTimeout(hardTimeout);
+          }
           resolve({
             launched,
             startupConfirmed,
@@ -721,6 +738,15 @@ export class SimulatorProcessManager {
         if (this.activeProcess === child) this.activeProcess = null;
         try { child.kill("SIGTERM"); } catch { /* already gone */ }
       };
+
+      const hardTimeout = options.timeoutMs && options.timeoutMs > 0
+        ? setTimeout(() => {
+            this.appendLog("system", `E_TIMEOUT: app startup exceeded ${options.timeoutMs}ms.`);
+            fatal = `E_TIMEOUT: app startup exceeded ${options.timeoutMs}ms`;
+            stopChild();
+            finish(false);
+          }, options.timeoutMs)
+        : undefined;
 
       const waitTimer = setTimeout(() => {
         // Flush any trailing partial lines before deciding.

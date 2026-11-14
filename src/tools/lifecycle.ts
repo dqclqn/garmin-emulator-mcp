@@ -5,10 +5,11 @@ import {
   parseDeviceProfile,
 } from "../metadata/device-parser.js";
 import { getActiveDesktop, getWindowInfo, setActiveDesktop } from "../simulator/bridge.js";
-import { launchIsolatedSimulator } from "../simulator/isolated.js";
+import { launchIsolatedSimulator, terminateIsolatedSimulator } from "../simulator/isolated.js";
 import { waitForStable } from "../simulator/receipts.js";
 import { applyDebugConfig } from "./build-config.js";
 import { processManager } from "../simulator/process-manager.js";
+import { clearPersistedSession, readPersistedSession, writePersistedSession, sessionId } from "../session/session.js";
 import {
   captureAndFormatScreenshot,
   getActiveDeviceId,
@@ -19,6 +20,13 @@ import {
 import type { DeviceProfile } from "../types.js";
 
 export interface SimulatorStatusResult {
+  session: {
+    id: string;
+    previousSessionId?: string;
+    adopted: boolean;
+    decision: "adopted-existing-simulator" | "current-session" | "no-simulator";
+    desktop?: string;
+  };
   running: boolean;
   port1234Open: boolean;
   windowId?: number;
@@ -51,7 +59,17 @@ export interface SimulatorStatusResult {
  * permissions, and active device profile.
  */
 export async function getSimulatorStatus(): Promise<SimulatorStatusResult> {
-  const windowInfo = await getWindowInfo();
+  const persistedBefore = readPersistedSession();
+  if (!getActiveDesktop() && persistedBefore?.running && persistedBefore.desktop) {
+    // A server restart cannot see the previous hidden desktop until it is set.
+    setActiveDesktop(persistedBefore.desktop);
+  }
+  let windowInfo = await getWindowInfo();
+  if (!windowInfo.running && getActiveDesktop() && persistedBefore?.desktop) {
+    // The persisted hidden desktop may be gone; retry the visible desktop.
+    setActiveDesktop(undefined);
+    windowInfo = await getWindowInfo();
+  }
   const port1234Open = await processManager.isSimulatorPortOpen(1234);
   const activeDeviceId = getActiveDeviceId();
 
@@ -62,7 +80,34 @@ export async function getSimulatorStatus(): Promise<SimulatorStatusResult> {
     // Device profile might not be parsed if SDK root not yet available
   }
 
+  const adoptedFrom =
+    persistedBefore?.adoptedFrom ??
+    (windowInfo.running && persistedBefore?.running && persistedBefore.sessionId !== sessionId
+      ? persistedBefore.sessionId
+      : undefined);
+  const decision: SimulatorStatusResult["session"]["decision"] = !windowInfo.running
+    ? "no-simulator"
+    : adoptedFrom
+      ? "adopted-existing-simulator"
+      : "current-session";
+  if (windowInfo.running) {
+    writePersistedSession({
+      sessionId,
+      running: true,
+      simulatorPid: windowInfo.pid,
+      desktop: windowInfo.desktop ?? getActiveDesktop(),
+      windowId: windowInfo.windowId,
+      adoptedFrom,
+    });
+  }
   const result: SimulatorStatusResult = {
+    session: {
+      id: sessionId,
+      previousSessionId: persistedBefore?.sessionId === sessionId ? persistedBefore?.adoptedFrom : persistedBefore?.sessionId,
+      adopted: Boolean(adoptedFrom),
+      decision,
+      desktop: windowInfo.desktop ?? getActiveDesktop(),
+    },
     running: windowInfo.running,
     port1234Open,
     windowId: windowInfo.windowId,
@@ -94,6 +139,65 @@ export async function getSimulatorStatus(): Promise<SimulatorStatusResult> {
   }
 
   return result;
+}
+
+/**
+ * Tool handler: session_start. Reports whether this server adopted a running
+ * simulator or started clean, and can explicitly reset the adoption.
+ */
+export async function handleSessionStart(args?: {
+  reset?: boolean;
+}): Promise<{ content: McpToolContent[]; isError?: boolean }> {
+  try {
+    if (args?.reset === true) {
+      const terminated = await terminateIsolatedSimulator(true);
+      clearPersistedSession();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                sessionId,
+                decision: "reset",
+                adopted: false,
+                terminated,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    const status = await getSimulatorStatus();
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              sessionId,
+              decision: status.session.decision,
+              adopted: status.session.adopted,
+              previousSessionId: status.session.previousSessionId,
+              running: status.running,
+              isolated: status.isolated,
+              desktop: status.desktop,
+              activeDeviceId: status.activeDeviceId,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+      isError: true,
+    };
+  }
 }
 
 /**
@@ -313,6 +417,22 @@ export async function handleSetActiveDevice(args: {
 }> {
   try {
     const profile = parseDeviceProfile(args.device_id);
+    const previous = processManager.getCurrentDeviceId() ?? getActiveDeviceId();
+    const running = await getWindowInfo();
+    if (running.running && previous !== profile.deviceId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `E_DEVICE_BINDING_REQUIRED: the simulator is running as ${previous}. ` +
+              `Terminate it before switching to ${profile.deviceId}, then launch again, ` +
+              `or pass device_id to run_app so the running device matches the metadata.`,
+          },
+        ],
+        isError: true,
+      };
+    }
     setManualActiveDeviceId(profile.deviceId);
 
     return {
@@ -367,6 +487,7 @@ export async function handleBuildApp(args: {
   output_prg_path?: string;
   extra_args?: string[];
   debug_channel?: boolean;
+  timeout_ms?: number;
 }): Promise<{
   content: McpToolContent[];
   isError?: boolean;
@@ -393,6 +514,7 @@ export async function handleBuildApp(args: {
         outputPrgPath: args.output_prg_path
           ? path.resolve(args.output_prg_path)
           : undefined,
+        timeoutMs: args.timeout_ms,
         extraArgs: args.extra_args,
       });
 
@@ -408,6 +530,7 @@ export async function handleBuildApp(args: {
                 debugChannel: args.debug_channel !== false,
                 outputPrgPath: result.outputPrgPath,
                 prgHash: result.prgHash,
+                code: result.success ? undefined : "E_BUILD_FAILED",
                 stdout: result.stdout,
                 stderr: result.stderr,
               },
@@ -443,6 +566,7 @@ export async function handleRunApp(args: {
   wait_ms?: number;
   capture_after?: boolean;
   startup_timeout_ms?: number;
+  timeout_ms?: number;
 }): Promise<{
   content: McpToolContent[];
   isError?: boolean;
@@ -458,6 +582,7 @@ export async function handleRunApp(args: {
       prgPath: resolvedPrgPath,
       deviceId,
       waitMs: args.wait_ms ?? 2500,
+      timeoutMs: args.timeout_ms,
     });
 
     let startup: Record<string, unknown> | undefined;
@@ -503,6 +628,7 @@ export async function handleRunApp(args: {
             launched: result.launched,
             startupConfirmed,
             startup,
+            code: result.launched ? undefined : "E_APP_NOT_LAUNCHED",
             fatalError: result.fatalError,
             deviceId: result.activeDeviceId,
             initialLogs: result.initialLogs,
