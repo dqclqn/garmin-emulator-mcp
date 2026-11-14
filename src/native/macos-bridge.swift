@@ -114,9 +114,14 @@ func handleWindowInfo() {
        let boundsDict = win[kCGWindowBounds as String] as? [String: Any],
        let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) {
         response["windowId"] = windowId
+        response["title"] = win[kCGWindowName as String] as? String ?? ""
         response["bounds"] = [
             "x": bounds.origin.x,
             "y": bounds.origin.y,
+            "width": bounds.size.width,
+            "height": bounds.size.height
+        ]
+        response["clientSize"] = [
             "width": bounds.size.width,
             "height": bounds.size.height
         ]
@@ -567,10 +572,126 @@ func handleUIAction(args: [String]) {
     printJSON(["ok": result == .success, "AXError": result.rawValue])
 }
 
+
+func simulatorWindowList() -> [[String: Any]] {
+    guard let app = findSimulatorApp(),
+          let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+    return list.filter { ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier }
+}
+
+func windowNumber(_ win: [String: Any]) -> Int? {
+    guard let number = win[kCGWindowNumber as String] as? CGWindowID else { return nil }
+    return Int(number)
+}
+
+func handleWindows() {
+    guard findSimulatorApp() != nil else {
+        printJSON(["ok": false, "error": "Connect IQ simulator is not running"])
+        return
+    }
+    let main = findSimulatorWindow(pid: findSimulatorApp()!.processIdentifier)
+    let mainId = main?[kCGWindowNumber as String] as? CGWindowID ?? 0
+    let windows = simulatorWindowList().compactMap { win -> [String: Any]? in
+        guard let number = win[kCGWindowNumber as String] as? CGWindowID,
+              let boundsDict = win[kCGWindowBounds as String] as? [String: Any],
+              let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else {
+            return nil
+        }
+        return [
+            "hwnd": Int(number),
+            "title": win[kCGWindowName as String] as? String ?? "",
+            "class": "AXWindow",
+            "visible": (win[kCGWindowLayer as String] as? Int ?? -1) == 0,
+            "rect": [
+                "x": bounds.origin.x,
+                "y": bounds.origin.y,
+                "width": bounds.size.width,
+                "height": bounds.size.height
+            ],
+            "isMain": number == mainId
+        ]
+    }
+    printJSON(["ok": true, "mainWindowId": Int(mainId), "windows": windows])
+}
+
+func handleCloseWindow(args: [String]) {
+    var hwnd: Int = 0
+    var idx = 0
+    while idx < args.count {
+        if args[idx] == "--hwnd" && idx + 1 < args.count {
+            hwnd = Int(args[idx + 1]) ?? 0
+            idx += 2
+        } else {
+            idx += 1
+        }
+    }
+    guard hwnd != 0, let app = findSimulatorApp(), AXIsProcessTrusted() else {
+        printJSON(["ok": false, "error": "Missing hwnd or Accessibility permission"])
+        return
+    }
+    let target = simulatorWindowList().first { windowNumber($0) == hwnd }
+    let title = target?[kCGWindowName as String] as? String ?? ""
+    let appRef = AXUIElementCreateApplication(app.processIdentifier)
+    guard let window = title.isEmpty ? nil : findWindow(appRef, title: title) else {
+        printJSON(["ok": false, "error": "Window \(hwnd) was not found through Accessibility"])
+        return
+    }
+
+    var closeButtonValue: AnyObject?
+    var result: AXError = .failure
+    if AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &closeButtonValue) == .success,
+       let closeButton = closeButtonValue {
+        result = AXUIElementPerformAction(closeButton as! AXUIElement, kAXPressAction as CFString)
+    }
+    if result != .success {
+        result = AXUIElementPerformAction(window, "AXClose" as CFString)
+    }
+    for _ in 0..<20 {
+        usleep(100_000)
+        if simulatorWindowList().first(where: { windowNumber($0) == hwnd }) == nil {
+            printJSON(["ok": true, "closed": true, "hwnd": hwnd, "AXError": result.rawValue])
+            return
+        }
+    }
+    printJSON(["ok": false, "closed": false, "hwnd": hwnd, "error": "Window remained open", "AXError": result.rawValue])
+}
+
+func handleMenuById(args: [String]) {
+    var menuId = 0
+    var idx = 0
+    while idx < args.count {
+        if args[idx] == "--id" && idx + 1 < args.count {
+            menuId = Int(args[idx + 1]) ?? 0
+            idx += 2
+        } else {
+            idx += 1
+        }
+    }
+    let paths: [Int: [String]] = [
+        5003: ["File", "Save Screen Capture"],
+        6005: ["File", "Kill App"],
+        6100: ["File", "Edit Persistent Storage"],
+        6123: ["Settings", "Trigger App Settings"],
+        6136: ["File", "Reset All App Data"],
+        6137: ["File", "Delete All Apps"],
+        6138: ["File", "Reset Simulator"],
+        6045: ["Settings", "Use Device HTTPS Requirements"],
+        6171: ["Settings", "Toggle Touch Screen"]
+    ]
+    guard let path = paths[menuId] else {
+        printJSON(["ok": false, "error": "No macOS menu mapping for id \(menuId); use the menu path instead"])
+        return
+    }
+    handleMenu(args: ["--path"] + path)
+}
+
+
 func main() {
     let args = Array(CommandLine.arguments.dropFirst())
     guard let cmd = args.first else {
-        printJSON(["error": "No command specified. Usage: macos-bridge <window-info|activate|click|drag|key|menu> [options]"])
+        printJSON(["error": "No command specified. Usage: macos-bridge <window-info|windows|capture|close-window|activate|click|drag|key|menu|menu-id> [options]"])
         exit(1)
     }
     
@@ -588,6 +709,12 @@ func main() {
         handleKey(args: subArgs)
     case "menu":
         handleMenu(args: subArgs)
+    case "menu-id":
+        handleMenuById(args: subArgs)
+    case "windows":
+        handleWindows()
+    case "close-window":
+        handleCloseWindow(args: subArgs)
     case "ui-tree":
         handleUITree(args: subArgs)
     case "ui-action":

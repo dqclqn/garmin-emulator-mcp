@@ -815,13 +815,13 @@ export function createServer(): McpServer {
     "Write storage keys through the in-app debug channel, then optionally read them back to verify. Use null to delete a key.",
     {
       values: z
-        .record(z.any())
+        .record(z.string(), z.any())
         .optional()
         .describe(
           "Storage values to write: scalar, string array, or a flat object. premium expects { active: boolean, code: string }; deck_list expects an array of ids."
         ),
       properties: z
-        .record(z.any())
+        .record(z.string(), z.any())
         .optional()
         .describe(
           "Debug property overrides to store as debug_prop_<key>. Supported keys: daily_goal, reveal_behavior, auto_advance, card_order, premium_enabled, deck_data, deck_2, deck_3, deck_4."

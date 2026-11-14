@@ -179,7 +179,7 @@ Snapshot scope: 1 to 8 uppercase PRG basenames without extensions or separators,
 - `run_unit_tests` must see a full passing table. Incomplete output is not a pass.
 - OCR and screenshot diffs are evidence, not functional proof.
 - Do not use `force: true` on `terminate_simulator` while an app is writing storage unless you accept the risk.
-- `list_windows`, `capture_window`, `close_window` and `reset_state` use the Windows bridge; the macOS bridge still covers the main window only.
+- `list_windows`, `capture_window`, `close_window` and `menu-id` have macOS implementations through CGWindow and Accessibility. Reset scopes use the macOS menu mapping; if a simulator build labels a menu differently, use `trigger_menu_action` with an explicit path.
 
 ## Client configuration
 
