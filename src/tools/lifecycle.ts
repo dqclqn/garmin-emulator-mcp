@@ -6,6 +6,7 @@ import {
 } from "../metadata/device-parser.js";
 import { getActiveDesktop, getWindowInfo, setActiveDesktop } from "../simulator/bridge.js";
 import { launchIsolatedSimulator } from "../simulator/isolated.js";
+import { waitForStable } from "../simulator/receipts.js";
 import { applyDebugConfig } from "./build-config.js";
 import { processManager } from "../simulator/process-manager.js";
 import {
@@ -441,6 +442,7 @@ export async function handleRunApp(args: {
   device_id?: string;
   wait_ms?: number;
   capture_after?: boolean;
+  startup_timeout_ms?: number;
 }): Promise<{
   content: McpToolContent[];
   isError?: boolean;
@@ -449,6 +451,8 @@ export async function handleRunApp(args: {
     const sdkPaths = locateGarminSdk();
     const deviceId = getActiveDeviceId(args.device_id);
     const resolvedPrgPath = path.resolve(args.prg_path);
+    const runLogSeq = processManager.getLogSeq();
+    const startedAt = Date.now();
 
     const result = await processManager.runAppInSimulator(sdkPaths, {
       prgPath: resolvedPrgPath,
@@ -456,13 +460,49 @@ export async function handleRunApp(args: {
       waitMs: args.wait_ms ?? 2500,
     });
 
+    let startup: Record<string, unknown> | undefined;
+    let startupConfirmed = result.startupConfirmed ?? false;
+    if (result.launched) {
+      const timeout = args.startup_timeout_ms ?? 8000;
+      const prgHash = await processManager.verifyPrgHash(resolvedPrgPath);
+      let stable: { stable: boolean; hash?: string; frames?: number; ms?: number } = { stable: false };
+      try {
+        stable = await waitForStable({ timeoutMs: Math.min(timeout, 5000), intervalMs: 150, settleMs: 250 });
+      } catch {
+        stable = { stable: false };
+      }
+      const marker = await processManager.waitForLogMarker(
+        /FLASHCARDS_APP_STARTED|\.onShow|onStart/i,
+        timeout,
+        runLogSeq
+      );
+      const info = await getWindowInfo();
+      startup = {
+        prgHash: prgHash.status,
+        prgHashExpected: prgHash.expected,
+        prgHashActual: prgHash.actual,
+        stableFrame: stable.stable,
+        stableHash: stable.hash,
+        stableFrames: stable.frames,
+        logMarker: marker.matched,
+        logLine: marker.line,
+        windowTitle: info.title ?? null,
+        elapsedMs: Date.now() - startedAt,
+      };
+      // A mismatched hash is fatal. A prebuilt PRG with no build hash and a
+      // marker plus a stable frame is still a confirmed start.
+      startupConfirmed =
+        prgHash.status !== "mismatch" && stable.stable && marker.matched;
+    }
+
     const content: McpToolContent[] = [
       {
         type: "text",
         text: JSON.stringify(
           {
             launched: result.launched,
-            startupConfirmed: result.startupConfirmed ?? false,
+            startupConfirmed,
+            startup,
             fatalError: result.fatalError,
             deviceId: result.activeDeviceId,
             initialLogs: result.initialLogs,

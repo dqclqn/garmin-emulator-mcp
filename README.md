@@ -30,7 +30,8 @@ Watch apps are awkward to test. The screen is tiny, there is no keyboard, and th
 | Inspect | Screenshots of the watch display, the bezel, or an annotated debug view. |
 | Read | App logs and crash output streamed back to the agent. |
 | Check | SDK, device profiles, signing key and simulator state before every run. |
-| State | Reads and seeds app storage, resets data and moves the app clock. |
+| State | Reads and seeds app storage and debug property overrides, resets data and moves the app clock. |
+| Message | Sends a phone-app message into the app and reads the stored payload back. |
 | Coverage | Builds and captures the same screen on several devices at once. |
 
 ## The loop

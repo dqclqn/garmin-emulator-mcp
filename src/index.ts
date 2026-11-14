@@ -40,6 +40,7 @@ import {
 } from "./tools/dialogs.js";
 import { handleCalibrate, handleMatrixDiff, handleMatrixRun } from "./tools/matrix.js";
 import { handleResetState } from "./tools/state.js";
+import { handlePhoneMessage } from "./tools/phone.js";
 import {
   handleDebugCommand,
   handleDebugPing,
@@ -210,6 +211,10 @@ export function createServer(): McpServer {
         .describe(
           "Whether to capture and return an initial watch screenshot after launching (default: true)"
         ),
+      startup_timeout_ms: z
+        .number()
+        .optional()
+        .describe("Maximum wait for a stable frame and startup log marker (default: 8000)"),
     },
     async (args) => handleRunApp(args)
   );
@@ -714,10 +719,34 @@ export function createServer(): McpServer {
     {
       values: z
         .record(z.any())
+        .optional()
         .describe(
           "Storage values to write: scalar, string array, or a flat object. premium expects { active: boolean, code: string }; deck_list expects an array of ids."
         ),
+      properties: z
+        .record(z.any())
+        .optional()
+        .describe(
+          "Debug property overrides to store as debug_prop_<key>. Supported keys: daily_goal, reveal_behavior, auto_advance, card_order, premium_enabled, deck_data, deck_2, deck_3, deck_4."
+        ),
       verify: z.boolean().optional().describe("Read back and compare after writing (default: true)"),
+      snapshot: z
+        .boolean()
+        .optional()
+        .describe("Snapshot app storage before writing premium, license or deck keys (default: true)"),
+      snapshot_dir: z.string().optional().describe("Directory for the snapshot"),
+      app_names: z
+        .array(z.string())
+        .optional()
+        .describe("Uppercase PRG basenames to snapshot; defaults to the last run PRG"),
+      prg_path: z
+        .string()
+        .optional()
+        .describe("PRG to restart after the snapshot; defaults to the last run PRG"),
+      device_id: z
+        .string()
+        .optional()
+        .describe("Device used when restarting after the snapshot; defaults to the last run device"),
       timeout_ms: z.number().optional().describe("Per-command timeout in milliseconds (default: 10000)"),
     },
     async (args) => handleStateSeed(args)
@@ -747,13 +776,24 @@ export function createServer(): McpServer {
 
   server.tool(
     "debug_command",
-    "Send a raw command to the in-app debug channel. Verbs: ping, state, seed, reset; arguments are semicolon-free strings.",
+    "Send a raw command to the in-app debug channel. Verbs: ping, state, seed, premium, deck_list, list, map, time, phone, reset; arguments are semicolon-free strings.",
     {
       verb: z.string().describe("Command verb, for example state"),
       args: z.array(z.string()).optional().describe("Positional arguments after the verb"),
       timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 10000)"),
     },
     async (args) => handleDebugCommand(args)
+  );
+
+  server.tool(
+    "phone_message",
+    "Deliver a phone-app message to the running app through the debug channel and let the app handler store it. Use state_read to verify last_phone_message.",
+    {
+      title: z.string().optional().describe("Message title"),
+      body: z.string().optional().describe("Message body"),
+      timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 10000)"),
+    },
+    async (args) => handlePhoneMessage(args)
   );
 
   server.tool(
@@ -799,6 +839,10 @@ export function createServer(): McpServer {
         .boolean()
         .optional()
         .describe("Kill the running app first so cached state cannot rewrite storage (default: true)"),
+      app_names: z
+        .array(z.string())
+        .optional()
+        .describe("Uppercase PRG basenames to snapshot; defaults to the last run PRG"),
     },
     async (args) => handleResetState(args)
   );

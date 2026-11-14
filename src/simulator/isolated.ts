@@ -25,6 +25,7 @@ export interface IsolatedLaunchResult {
   windowId?: number;
   bounds?: { x: number; y: number; width: number; height: number };
   clientSize?: { width: number; height: number };
+  expectedClientWidth?: number;
 }
 
 /**
@@ -55,6 +56,7 @@ export async function launchIsolatedSimulator(options: {
     const deadline = Date.now() + (options.waitMs ?? 25000);
     let stable: { width: number; height: number } | undefined;
     let stableCount = 0;
+    let firstWindowAt: number | undefined;
     let info = await getWindowInfo(desktop);
 
     while (Date.now() < deadline) {
@@ -63,20 +65,25 @@ export async function launchIsolatedSimulator(options: {
       if (!info.running || !info.windowId) {
         continue;
       }
-      const widthOk =
-        options.expectedClientWidth === undefined ||
-        (info.clientSize?.width ?? 0) >= options.expectedClientWidth;
+      if (!firstWindowAt) {
+        firstWindowAt = Date.now();
+      }
+      // The simulator may open at a placeholder size and only resize when the
+      // device app runs. Require a real client area, not the final bezel width;
+      // run_app waits for the first stable device frame.
+      const widthOk = (info.clientSize?.width ?? 0) > 0;
       const size = info.bounds
         ? { width: info.bounds.width, height: info.bounds.height }
         : undefined;
-      if (widthOk && size && size.width > 0 && size.height > 0) {
+      const settled = Date.now() - firstWindowAt >= 5000;
+      if (widthOk && settled && size && size.width > 0 && size.height > 0) {
         if (stable && stable.width === size.width && stable.height === size.height) {
           stableCount += 1;
         } else {
           stable = size;
           stableCount = 1;
         }
-        if (stableCount >= 2) {
+        if (stableCount >= 3) {
           break;
         }
       }
@@ -98,6 +105,7 @@ export async function launchIsolatedSimulator(options: {
       windowId: info.windowId,
       bounds: info.bounds,
       clientSize: info.clientSize,
+      expectedClientWidth: options.expectedClientWidth,
     };
   } catch (error) {
     setActiveDesktop(undefined);

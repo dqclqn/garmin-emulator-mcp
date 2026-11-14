@@ -73,6 +73,7 @@ export interface WindowInfoResponse {
   running: boolean;
   pid?: number;
   windowId?: number;
+  title?: string;
   bounds?: Rect;
   clientSize?: { width: number; height: number };
   contentOffset?: Point;

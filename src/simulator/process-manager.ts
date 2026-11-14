@@ -89,6 +89,7 @@ export class SimulatorProcessManager {
   private activeProcess: ChildProcess | null = null;
   private lastBuildPath?: string;
   private lastBuildHash?: string;
+  private lastRunInfo?: { prgPath: string; deviceId: string };
 
   constructor(maxBufferSize = 500) {
     this.maxBufferSize = maxBufferSize;
@@ -586,6 +587,59 @@ export class SimulatorProcessManager {
    * Streams stdout and stderr lines into the log ring buffer.
    * Waits until deviceStarted / appStarted is detected or waitMs elapses.
    */
+  /** The most recent app launch, used by reset and seeding snapshots. */
+  public getLastRun(): { prgPath: string; deviceId: string } | undefined {
+    return this.lastRunInfo ? { ...this.lastRunInfo } : undefined;
+  }
+
+  /** PRG basename in the uppercase form the simulator uses for storage. */
+  public getLastRunPrgBasename(): string | undefined {
+    return this.lastRunInfo
+      ? path.basename(this.lastRunInfo.prgPath, path.extname(this.lastRunInfo.prgPath)).toUpperCase()
+      : undefined;
+  }
+
+  /** Compares a PRG on disk with the last successful build in this session. */
+  public async verifyPrgHash(prgPath: string): Promise<{
+    status: "matched" | "mismatch" | "no-build-recorded";
+    expected?: string;
+    actual?: string;
+  }> {
+    const actual = await this.hashPrg(prgPath);
+    if (!this.lastBuildHash) {
+      return { status: "no-build-recorded", actual };
+    }
+    return {
+      status: actual === this.lastBuildHash ? "matched" : "mismatch",
+      expected: this.lastBuildHash,
+      actual,
+    };
+  }
+
+  /** Waits for a log line matching `marker` after `sinceSeq`. */
+  public async waitForLogMarker(
+    marker: RegExp,
+    timeoutMs: number,
+    sinceSeq: number
+  ): Promise<{ matched: boolean; line?: string; seq?: number; elapsedMs: number }> {
+    const started = Date.now();
+    while (Date.now() - started <= timeoutMs) {
+      const entries = this.getLogEntries({ sinceSeq });
+      for (const entry of entries) {
+        if (marker.test(entry.text)) {
+          return {
+            matched: true,
+            line: entry.text,
+            seq: entry.seq,
+            elapsedMs: Date.now() - started,
+          };
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+    return { matched: false, elapsedMs: Date.now() - started };
+  }
+
   public async runAppInSimulator(
     sdkPaths: GarminSdkPaths,
     options: RunAppOptions
@@ -631,6 +685,7 @@ export class SimulatorProcessManager {
       }
     }
 
+    this.lastRunInfo = { prgPath: path.resolve(options.prgPath), deviceId: options.deviceId };
     const args = this.buildMonkeyDoArgs(options.prgPath, options.deviceId);
     this.appendLog("system", `Running app with monkeydo: ${sdkPaths.monkeydoPath} ${args.join(" ")}`);
 

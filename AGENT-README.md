@@ -4,7 +4,7 @@ This file is the operating reference for an AI agent driving this server. The hu
 
 - Transport: stdio, one JSON-RPC session.
 - Entry point: `node /path/to/garmin-simulator-mcp/dist/index.js`.
-- Tools: 43. Optional parameters are marked `?`.
+- Tools: 44. Optional parameters are marked `?`.
 - One server may drive the simulator at a time. A second instance exits with code 2 and names the lock owner.
 
 ## Suggested loop
@@ -56,7 +56,7 @@ macOS needs Screen Recording and Accessibility permissions for the terminal or I
 | `list_devices` | `query?`, `touch_only?` | Installed profiles with resolution, touch support, shape and buttons. |
 | `set_active_device` | `device_id` | Sets the metadata profile only. It does not switch the running simulator device. Pass the same `device_id` to build and run. |
 | `build_app` | `project_dir`, `device_id?`, `jungle_file?`, `developer_key_path?`, `output_prg_path?`, `extra_args?`, `debug_channel?` (true) | Compiles with `monkeyc`, swapping in the debug or release automation config first. Returns `success`, `exitCode`, `deviceId`, `debugChannel`, `outputPrgPath`, `prgHash`, `stdout`, `stderr`. |
-| `run_app` | `prg_path`, `device_id?`, `wait_ms?` (2500), `capture_after?` (true) | Pushes the PRG with `monkeydo` and streams logs. Refuses a PRG whose hash differs from the last successful build for that path with `E_STALE_PRG`. `startupConfirmed` stays false unless a known startup marker appears; judge from logs and screenshots. |
+| `run_app` | `prg_path`, `device_id?`, `wait_ms?` (2500), `capture_after?` (true), `startup_timeout_ms?` (8000) | Pushes the PRG with `monkeydo` and streams logs. Refuses a PRG whose hash differs from the last successful build with `E_STALE_PRG`. Returns `startupConfirmed` plus a `startup` object with the PRG hash match, stable frame, log marker and window title. |
 | `stop_app` | none | Stops the managed launcher only. The app can keep running in the simulator. |
 | `run_unit_tests` | `prg_path`, `device_id?`, `test_name?`, `timeout_ms?` (30000) | Runs `monkeydo -t` and parses the result table. Requires a complete, consistent, passing table with no fatal output, signal or timeout. |
 | `terminate_simulator` | `force?` (false) | Graceful close, waiting up to 5s. Use `force: true` only for an unresponsive simulator. |
@@ -130,12 +130,13 @@ Prerequisites: the app is compiled with `DEBUG_CHANNEL_ENABLED = true` (`source/
 |---|---|---|
 | `debug_status` | none | Endpoint, queued and pending commands, last poll age, last result. A null poll timestamp means no app has polled yet. |
 | `debug_ping` | `timeout_ms?` (10000) | Round-trips `ping`. Proves the app is running and polling. |
-| `state_read` | `keys?`, `timeout_ms?` | Storage keys and app properties. Requested keys are sent to the app, so per-deck and other custom keys are readable. `prop:` prefixes property values; arrays and dictionaries report size, long strings report length. |
-| `state_seed` | `values` (scalar, string array, or flat object), `verify?` (true), `timeout_ms?` | Writes storage with the correct shape: `premium` expects `{ active, code }`, `deck_list` expects an array of ids, other arrays become string arrays, and objects become string maps. Reads back and compares shape and contents. `null` deletes a key. App properties are rejected. |
+| `state_read` | `keys?`, `timeout_ms?` | Storage keys and app properties. Requested keys are sent to the app, so per-deck and other custom keys are readable. `prop:` is the compile-time property, `propOverride:` is the debug override; arrays and dictionaries report size, long strings report length. |
+| `state_seed` | `values?` (scalar, string array, or flat object), `properties?`, `verify?` (true), `snapshot?` (true), `snapshot_dir?`, `app_names?`, `prg_path?`, `device_id?`, `timeout_ms?` | Writes storage with the correct shape: `premium` expects `{ active, code }`, `deck_list` expects an array of ids, other arrays become string arrays, objects become string maps. `properties` writes `debug_prop_<key>` overrides. Sensitive keys stop the app, snapshot `DATA/APP.DAT`, restart it and refuse to write if the snapshot fails. `null` deletes a key. |
 | `state_reset` | `verify?` (true), `timeout_ms?` | Clears every storage key through `Storage.clearValues()`. Restart the app for a clean first launch. |
 | `set_time` | `offset_seconds?`, `iso?`, `clear?`, `timeout_ms?` | Stores a clock offset used by `DebugClock` in SRS and date code. Does not change the simulator clock. |
-| `reset_state` | `scope?` (app, all_apps, simulator), `confirm` (true), `snapshot?`, `snapshot_dir?`, `verify?`, `wait_ms?`, `stop_app?` (true) | For app scope, clears storage through the debug channel and then kills the app so cached writes cannot restore it; returns `resetVia: "debug-channel"`. Other scopes use the simulator menu. Snapshots APPS and captures a before image first, and detects a confirmation dialog instead of guessing. |
-| `debug_command` | `verb`, `args?`, `timeout_ms?` | Raw channel escape hatch. Verbs: `ping`, `state`, `seed`, `reset`, `time`. |
+| `reset_state` | `scope?` (app, all_apps, simulator), `confirm` (true), `snapshot?`, `snapshot_dir?`, `verify?`, `wait_ms?`, `stop_app?` (true), `app_names?`, `prg_path?`, `device_id?` | For app scope, stops the app, snapshots DATA, restarts it for the channel clear and kills it afterwards; returns `resetVia: "debug-channel"`. Other scopes use the simulator menu. Tries Enter on a confirmation dialog and reports `needsConfirmation` when it cannot close it. |
+| `debug_command` | `verb`, `args?`, `timeout_ms?` | Raw channel escape hatch. Verbs: `ping`, `state`, `seed`, `reset`, `time`, `phone`. |
+| `phone_message` | `title?`, `body?`, `timeout_ms?` | Delivers a phone-app message through the debug channel. The app stores it as `last_phone_message`; read it back with `state_read`. |
 
 Storage values are app-specific. The reference app uses `onboarding_complete`, `premium`, `deck_list`, `stats`, `settings` and `active_deck_id`; its properties are `daily_goal`, `reveal_behavior`, `auto_advance`, `card_order`, `premium_enabled` and `deck_data`.
 

@@ -4,7 +4,14 @@ import {
   runDebugCommand,
   type DebugResult,
 } from "../debug/channel.js";
+import path from "node:path";
 import type { McpToolContent } from "./shared.js";
+import { capturesDir } from "../session/session.js";
+import { processManager } from "../simulator/process-manager.js";
+import { getWindowInfo, runBridgeCommand } from "../simulator/bridge.js";
+import { locateGarminSdk } from "../config/sdk-locator.js";
+import { waitForDebugChannel } from "../debug/readiness.js";
+import { snapshotAppFiles } from "./testing.js";
 
 function text(text: string): { content: McpToolContent[]; isError?: boolean } {
   return { content: [{ type: "text", text }] };
@@ -38,10 +45,10 @@ export function parseState(raw: string): Record<string, string> {
   return state;
 }
 
-type SeedScalar = string | number | boolean | null;
+export type SeedScalar = string | number | boolean | null;
 type SeedValue = SeedScalar | SeedScalar[] | Record<string, SeedScalar>;
 
-const PROPERTY_KEYS = new Set([
+export const PROPERTY_KEYS = new Set([
   "daily_goal",
   "reveal_behavior",
   "auto_advance",
@@ -210,6 +217,7 @@ export async function handleStateRead(args?: {
     const wanted = new Set(requested);
     if (wanted.has("premium")) {
       wanted.add("premium_active");
+      wanted.add("premium_effective");
     }
     if (wanted.has("deck_list")) {
       wanted.add("deck_ids");
@@ -220,7 +228,10 @@ export async function handleStateRead(args?: {
             if (wanted.has(key)) {
               return true;
             }
-            return key.startsWith("prop:") && wanted.has(key.slice(5));
+            if (key.startsWith("prop:") && wanted.has(key.slice(5))) {
+              return true;
+            }
+            return key.startsWith("propOverride:") && wanted.has(key.slice(13));
           })
         )
       : state;
@@ -242,14 +253,97 @@ export async function handleStateRead(args?: {
 }
 
 export async function handleStateSeed(args: {
-  values: Record<string, SeedValue>;
+  values?: Record<string, SeedValue>;
+  properties?: Record<string, SeedScalar>;
   verify?: boolean;
+  snapshot?: boolean;
+  snapshot_dir?: string;
+  app_names?: string[];
+  prg_path?: string;
+  device_id?: string;
   timeout_ms?: number;
 }): Promise<{ content: McpToolContent[]; isError?: boolean }> {
   try {
     const entries = Object.entries(args.values ?? {});
-    if (entries.length === 0) {
-      return failure("Pass at least one value to seed.");
+    const propertyEntries = Object.entries(args.properties ?? {});
+    if (entries.length === 0 && propertyEntries.length === 0) {
+      return failure("Pass at least one storage value or property override to seed.");
+    }
+
+    const sensitiveStorage = entries.some(([key]) =>
+      /^(premium|license_key|deck_|deck_list|deck_default|deck_stats)/.test(key)
+    );
+    const sensitiveProperties = propertyEntries.some(
+      ([key]) => key === "deck_data" || key.startsWith("deck_")
+    );
+    let snapshot: unknown;
+    let httpsToggled = false;
+    let restartedForSnapshot = false;
+    if ((sensitiveStorage || sensitiveProperties) && args.snapshot !== false) {
+      const lastRun = processManager.getLastRun();
+      const prgPath = args.prg_path ?? lastRun?.prgPath;
+      const deviceId = args.device_id ?? lastRun?.deviceId;
+      if (!prgPath || !deviceId) {
+        return failure(
+          "Refusing to seed sensitive keys without a restorable snapshot: no last run PRG is recorded. " +
+            "Pass prg_path and device_id, or set snapshot: false explicitly."
+        );
+      }
+      const info = await getWindowInfo();
+      if (!info.running || !info.windowId) {
+        return failure("The simulator is not running; cannot snapshot before seeding.");
+      }
+      const hwndArgs = info.isolated && info.windowId ? ["--hwnd", String(info.windowId)] : [];
+      // The object store is flushed on app stop. Stop first, copy DATA, then
+      // restart the app so the debug channel can perform the write.
+      await runBridgeCommand(["menu-id", "--id", "6005", ...hwndArgs]);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const names = (args.app_names && args.app_names.length > 0
+        ? args.app_names
+        : [processManager.getLastRunPrgBasename() ?? "APP"]
+      ).map((name) => name.toUpperCase());
+      const directory = path.resolve(
+        args.snapshot_dir ?? path.join(capturesDir(), `seed-${stamp}`)
+      );
+      try {
+        snapshot = await snapshotAppFiles(directory, names);
+      } catch (error) {
+        return failure(
+          `Refusing to seed sensitive keys without a snapshot: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+
+      const restartLogSeq = processManager.getLogSeq();
+      const relaunch = await processManager.runAppInSimulator(locateGarminSdk(), {
+        prgPath: path.resolve(prgPath),
+        deviceId,
+        waitMs: 3000,
+      });
+      if (!relaunch.launched) {
+        return failure(
+          `Snapshot saved at ${directory}, but the app could not be restarted for seeding: ${
+            relaunch.fatalError ?? "launch failed"
+          }`
+        );
+      }
+      const readiness = await waitForDebugChannel({
+        hwndArgs,
+        sinceSeq: restartLogSeq,
+        timeoutMs: 15000,
+      });
+      if (!readiness.ready) {
+        return failure(
+          `Snapshot saved at ${directory}, but the app did not poll the debug channel after restart: ${
+            readiness.lastError ?? "timeout"
+          }. No values were written.`
+        );
+      }
+      httpsToggled = readiness.httpsToggled;
+      restartedForSnapshot = true;
     }
 
     const plans: Array<{ key: string; plan: SeedPlan }> = [];
@@ -273,6 +367,39 @@ export async function handleStateSeed(args: {
       if (!result.ok) {
         return failure(`Seeding ${key} failed: ${result.data}`);
       }
+      plans.push({ key, plan });
+      seeded.push(key);
+    }
+
+    for (const [property, value] of propertyEntries) {
+      if (!PROPERTY_KEYS.has(property)) {
+        return failure(
+          `${property} is not a known app property. Use one of: ${[...PROPERTY_KEYS].join(", ")}.`
+        );
+      }
+      if (value !== null && typeof value === "object") {
+        return failure(`Property override ${property} must be a scalar.`);
+      }
+      const plan = planSeed(`debug_prop_${property}`, value);
+      if (typeof plan === "string") {
+        return failure(plan);
+      }
+      plan.checks =
+        value === null
+          ? [{ field: `debug_prop_${property}`, expected: "null" }]
+          : plan.checks.map((check) => ({
+              ...check,
+              field: `propOverride:${property}`,
+            }));
+      const result = await runDebugCommand(
+        plan.verb,
+        plan.args,
+        args.timeout_ms ?? 10000
+      );
+      if (!result.ok) {
+        return failure(`Seeding property ${property} failed: ${result.data}`);
+      }
+      const key = `property:${property}`;
       plans.push({ key, plan });
       seeded.push(key);
     }
@@ -312,6 +439,9 @@ export async function handleStateSeed(args: {
       JSON.stringify(
         {
           seeded,
+          snapshot,
+          restartedForSnapshot,
+          httpsToggled,
           verification: args.verify === false ? undefined : verification,
         },
         null,

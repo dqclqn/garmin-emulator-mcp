@@ -407,7 +407,7 @@ function Invoke-One($a) {
     $pt=New-Object GarminWin+POINT; [void][GarminWin]::ClientToScreen($main,[ref]$pt)
     $cr=New-Object GarminWin+RECT; [void][GarminWin]::GetClientRect($main,[ref]$cr)
     $owner=[uint32]0; [void][GarminWin]::GetWindowThreadProcessId($main,[ref]$owner)
-    output @{running=$true; pid=$owner; windowId=$main.ToInt64(); bounds=@{x=$r.Left; y=$r.Top; width=($r.Right-$r.Left); height=($r.Bottom-$r.Top)}; clientSize=@{width=($cr.Right-$cr.Left); height=($cr.Bottom-$cr.Top)}; contentOffset=@{x=($pt.X-$r.Left); y=($pt.Y-$r.Top)}; scale=1; foreground=$false; isolated=$true; desktop=$desktop; permissions=$permissions}
+    output @{running=$true; pid=$owner; windowId=$main.ToInt64(); title=([GarminWin]::Title($main)); bounds=@{x=$r.Left; y=$r.Top; width=($r.Right-$r.Left); height=($r.Bottom-$r.Top)}; clientSize=@{width=($cr.Right-$cr.Left); height=($cr.Bottom-$cr.Top)}; contentOffset=@{x=($pt.X-$r.Left); y=($pt.Y-$r.Top)}; scale=1; foreground=$false; isolated=$true; desktop=$desktop; permissions=$permissions}
     break
   }
   $p=simulator
@@ -416,7 +416,7 @@ function Invoke-One($a) {
   $pt=New-Object GarminWin+POINT; [void][GarminWin]::ClientToScreen($p.MainWindowHandle,[ref]$pt)
   $dpiX=[uint32]0; $dpiY=[uint32]0; if ([GarminWin]::GetDpiForMonitor([GarminWin]::MonitorFromWindow($p.MainWindowHandle,2),0,[ref]$dpiX,[ref]$dpiY) -ne 0 -or $dpiX -eq 0) { throw 'Unable to determine simulator monitor DPI' }
   $cs = clientSize $p
-  output @{running=$true; pid=$p.Id; windowId=$p.MainWindowHandle.ToInt64(); bounds=@{x=$r.Left; y=$r.Top; width=($r.Right-$r.Left); height=($r.Bottom-$r.Top)}; clientSize=$cs; contentOffset=@{x=($pt.X-$r.Left); y=($pt.Y-$r.Top)}; scale=($dpiX/96.0); foreground=([GarminWin]::GetForegroundWindow() -eq $p.MainWindowHandle); permissions=$permissions}
+  output @{running=$true; pid=$p.Id; windowId=$p.MainWindowHandle.ToInt64(); title=([GarminWin]::Title($p.MainWindowHandle)); bounds=@{x=$r.Left; y=$r.Top; width=($r.Right-$r.Left); height=($r.Bottom-$r.Top)}; clientSize=$cs; contentOffset=@{x=($pt.X-$r.Left); y=($pt.Y-$r.Top)}; scale=($dpiX/96.0); foreground=([GarminWin]::GetForegroundWindow() -eq $p.MainWindowHandle); permissions=$permissions}
  }
  { $_ -in 'activate','raise','focus' } { $p=win; output (focusWindow $p) }
  'restore-focus' {
