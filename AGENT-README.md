@@ -1,6 +1,6 @@
 # Garmin Simulator MCP: Agent Reference
 
-This file is the operating reference for an AI agent driving this server. The human-facing overview lives in [README.md](README.md). Local design notes live in `docs/`, which is gitignored.
+This file is the operating reference for an AI agent driving this server. The human-facing overview lives in [README.md](README.md).
 
 - Transport: stdio, one JSON-RPC session.
 - Entry point: `node /path/to/garmin-simulator-mcp/dist/index.js`.
@@ -169,5 +169,3 @@ npm test                 # 8 regression suites
 npm run typecheck:test   # type-check the test project
 npm run test:e2e         # live simulator check, presses a button
 ```
-
-`docs/TESTING.md` has the local testing notes and known gaps.
