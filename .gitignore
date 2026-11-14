@@ -1,0 +1,7 @@
+node_modules/
+dist/
+bin/macos-bridge
+*.DS_Store
+.tmp/
+*.log
+docs/
