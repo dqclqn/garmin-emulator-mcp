@@ -1,4 +1,4 @@
-# Garmin Simulator MCP: Agent Reference
+# Garmin Emulator MCP: Agent Reference
 
 This file is the operating reference for an AI agent driving this server. The human-facing overview lives in [README.md](README.md).
 

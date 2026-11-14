@@ -1,4 +1,4 @@
-# Garmin Simulator MCP
+# Garmin Emulator MCP
 
 ```text
                                       █████████
