@@ -10,7 +10,7 @@ This file is the operating reference for an AI agent driving this server. The hu
 ## Suggested loop
 
 1. `doctor` with the project directory.
-2. `launch_simulator` and wait for `ready: true`.
+2. `launch_simulator` and wait for `processReady: true`. Geometry can stay placeholder until the first app run.
 3. `build_app`, then `run_app` with the returned `outputPrgPath`.
 4. `wait_for_stable`, then `get_screenshot`.
 5. `press_button` (or `press_button_sequence`) with `expect: "change"`.
@@ -56,14 +56,14 @@ macOS needs Screen Recording and Accessibility permissions for the terminal or I
 |---|---|---|
 | `simulator_status` | none | Running state, window id, bounds, client size, foreground flag, `isolated`, `desktop`, TCP 1234 state, permission fields, active device profile and the `session` adoption decision. |
 | `session_start` | `reset?` (false) | Reports whether this server adopted a simulator left by an earlier session. `reset: true` terminates it and clears `session-state.json`. |
-| `launch_simulator` | `wait_ms?` (25000), `isolated?` (true on Windows) | Creates a hidden desktop and launches the simulator there, then waits for the final client size. Returns `started`, `portOpen`, `ready`, `isolated`, `desktop`, `window`, `clientSize`. Set `isolated: false` for the visible desktop and the focus lease. If a simulator is already running, it reports `alreadyRunning` instead of relaunching. |
+| `launch_simulator` | `wait_ms?` (25000), `isolated?` (true on Windows) | Creates a hidden desktop and launches the simulator there. Returns `started`, `portOpen`, `processReady`, `ready`, `geometryReady`, `windowStable`, `placeholderSize`, `expectedClientWidth`, `window` and `clientSize`. A cold window can be 350x700 until the app runs; `ready` is false while the placeholder size remains. Set `isolated: false` for the visible desktop. If a simulator is already running, it reports `alreadyRunning`. |
 | `list_devices` | `query?`, `touch_only?` | Installed profiles with resolution, touch support, shape and buttons. |
 | `set_active_device` | `device_id` | Sets the metadata profile when the simulator is stopped. While it is running and the id differs, returns `E_DEVICE_BINDING_REQUIRED`; terminate first or pass `device_id` to `run_app`. |
 | `build_app` | `project_dir`, `device_id?`, `jungle_file?`, `developer_key_path?`, `output_prg_path?`, `extra_args?`, `debug_channel?` (true), `timeout_ms?` | Compiles with `monkeyc`, swapping in the debug or release automation config first. A timeout kills the compiler with `E_TIMEOUT`. Returns `success`, `exitCode`, `deviceId`, `debugChannel`, `outputPrgPath`, `prgHash`, `stdout`, `stderr`. |
 | `run_app` | `prg_path`, `device_id?`, `wait_ms?` (2500), `capture_after?` (true), `startup_timeout_ms?` (8000), `timeout_ms?` | Pushes the PRG with `monkeydo` and streams logs. Refuses a PRG whose hash differs from the last successful build with `E_STALE_PRG`. Returns `startupConfirmed` plus a `startup` object with the PRG hash match, stable frame, log marker and window title. |
 | `dev_loop` | `project_dir`, `device_id?`, `debug_channel?` (true), `wait_ms?`, `settle_ms?`, `log_lines?` (40), `jungle_file?`, `developer_key_path?` | Builds, runs, captures the first frame and returns the log tail in one call. |
 | `stop_app` | none | Stops the managed launcher only. The app can keep running in the simulator. |
-| `run_unit_tests` | `prg_path`, `device_id?`, `test_name?`, `timeout_ms?` (30000) | Runs `monkeydo -t` and parses the result table. Requires a complete, consistent, passing table with no fatal output, signal or timeout. |
+| `run_unit_tests` | `prg_path`, `device_id?`, `test_name?`, `timeout_ms?` (30000) | Runs `monkeydo -t` and parses the result table. Requires a complete, consistent, passing table with no fatal output, signal or timeout. Normalizes the SDK 9.x exit-code 1 quirk to `exitCode: 0`; the raw value appears as `sdkExitCode` when it differs. |
 | `terminate_simulator` | `force?` (false) | Graceful close, waiting up to 5s. Use `force: true` only for an unresponsive simulator. |
 | `place_window` | `x?`, `y?`, `width?`, `height?` | Moves or clamps the window inside the nearest monitor work area. With no arguments it only rescues a window that is mostly off-screen. |
 | `doctor` | `project_dir?` | Checks SDK paths, profiles, Java, PowerShell, developer key, port, window geometry, foreground, occlusion at the client centre, log file and lock. Sets `isError` on a failed check. |
@@ -149,7 +149,7 @@ Storage values are app-specific. The reference app uses `onboarding_complete`, `
 
 | Tool | Parameters | Behaviour |
 |---|---|---|
-| `matrix_run` | `project_dir`, `devices[]`, `baseline_dir?`, `output_dir?`, `update_baselines?`, `wait_ms?`, `settle_ms?`, `threshold?`, `jungle_file?`, `developer_key_path?`, `debug_channel?` (true), `reset_before_each?` (true), `isolated?` (true on Windows), `steps?[]` | Builds, runs and captures each device, then optionally runs up to 20 `button`, `tap`, `swipe`, `hold` or `wait` steps with a baseline per step. Launches isolated on Windows by default. |
+| `matrix_run` | `project_dir`, `devices[]`, `baseline_dir?`, `output_dir?`, `update_baselines?`, `wait_ms?`, `settle_ms?`, `threshold?`, `jungle_file?`, `developer_key_path?`, `debug_channel?` (true), `reset_before_each?` (true), `isolated?` (true on Windows), `steps?[]` | Builds, runs and captures each device, then optionally runs up to 20 `button`, `tap`, `swipe`, `hold` or `wait` steps with a baseline per step. A cold first device resets after launch and restarts; later devices reset before build. Reports `stateReset`, `stateResetPhase` and `stateResetReason`. |
 | `matrix_diff` | `baseline_dir`, `output_dir?`, `threshold?` | Compares every baseline PNG with its current counterpart. Returns matched, differing and missing counts plus changed percentage and bounds. |
 | `calibrate` | `device_id?`, `save_path?`, `verify?`, `grid?` (2 to 5) | Reports window, bezel, display and button geometry. With `verify`, taps a grid on touch devices and reports changed pixels at each point. |
 
@@ -176,7 +176,7 @@ Snapshot scope: 1 to 8 uppercase PRG basenames without extensions or separators,
 
 - `stop_app` is not proof that background writes stopped. `terminate_simulator` is the only reliable shutdown, and it does not delete stored data.
 - `restore_app_files` is destructive inside its app scope and needs `confirm_stopped: true`; the flag is caller confirmation, not an idle check.
-- `run_unit_tests` must see a full passing table. Incomplete output is not a pass.
+- `run_unit_tests` must see a full passing table. Incomplete output is not a pass. A complete pass normalizes the SDK exit-code 1 quirk to `0`; the raw value appears as `sdkExitCode`.
 - OCR and screenshot diffs are evidence, not functional proof.
 - Do not use `force: true` on `terminate_simulator` while an app is writing storage unless you accept the risk.
 - `list_windows`, `capture_window`, `close_window` and `menu-id` have macOS implementations through CGWindow and Accessibility. Reset scopes use the macOS menu mapping; if a simulator build labels a menu differently, use `trigger_menu_action` with an explicit path.

@@ -5,6 +5,13 @@
   "license": "Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "AGENT-README.md",
+    "LICENSE"
+  ],
   "bin": {
     "garmin-emulator-mcp": "dist/index.js"
   },

@@ -3,9 +3,10 @@ import path from "node:path";
 import sharp from "sharp";
 import { locateGarminSdk } from "../config/sdk-locator.js";
 import { processManager } from "../simulator/process-manager.js";
-import { getWindowInfo, captureRawWindowPng } from "../simulator/bridge.js";
+import { getWindowInfo, captureRawWindowPng, runBridgeCommand } from "../simulator/bridge.js";
 import { captureScreen, diffPngBuffers } from "../simulator/receipts.js";
 import { runDebugCommand } from "../debug/channel.js";
+import { waitForDebugChannel } from "../debug/readiness.js";
 import { formatScreenshotResult, resolveActiveDeviceProfile, structuredResult, type McpToolContent } from "./shared.js";
 import { applyDebugConfig } from "./build-config.js";
 import { launchIsolatedSimulator } from "../simulator/isolated.js";
@@ -89,32 +90,56 @@ export async function handleMatrixRun(args: {
     }
 
     const report: Array<Record<string, unknown>> = [];
-    let channelAvailable = false;
-    try {
-      const ping = await runDebugCommand("ping", [], 1500);
-      channelAvailable = ping.ok;
-    } catch {
-      channelAvailable = false;
-    }
+
+    const waitForPing = async (timeoutMs = 8000): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        try {
+          const ping = await runDebugCommand("ping", [], 1000);
+          if (ping.ok) return true;
+        } catch {
+          // The app may still be starting.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      return false;
+    };
+
+    const stopRunningApp = async (): Promise<void> => {
+      try {
+        const info = await getWindowInfo();
+        const hwndArgs = info.isolated && info.windowId ? ["--hwnd", String(info.windowId)] : [];
+        await runBridgeCommand(["menu-id", "--id", "6005", ...hwndArgs]);
+      } catch {
+        // Fall back to stopping the managed launcher.
+      }
+      await processManager.stopActiveApp();
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    };
 
     for (const deviceId of args.devices) {
       const entry: Record<string, unknown> = { deviceId };
       const startedBuild = Date.now();
       const prgPath = path.join(projectDir, "bin", `app-${deviceId}.prg`);
 
+      let stateReset = false;
       if (args.reset_before_each !== false) {
-        if (channelAvailable) {
-          try {
-            await runDebugCommand("reset", [], 2500);
-            entry.stateReset = true;
-          } catch {
-            entry.stateReset = false;
+        try {
+          const ping = await runDebugCommand("ping", [], 1200);
+          if (ping.ok) {
+            const reset = await runDebugCommand("reset", [], 2500);
+            stateReset = reset.ok;
+            if (stateReset) {
+              entry.stateResetPhase = "before-build";
+              await stopRunningApp();
+            }
           }
-        } else {
-          entry.stateReset = false;
+        } catch {
+          // No app is running yet on a cold start; reset after launch instead.
         }
-        await processManager.stopActiveApp();
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        if (!stateReset) {
+          entry.stateResetReason = "no-running-app";
+        }
       }
 
       try {
@@ -158,6 +183,51 @@ export async function handleMatrixRun(args: {
         report.push(entry);
         continue;
       }
+
+      if (args.reset_before_each !== false && !stateReset) {
+        const info = await getWindowInfo();
+        const hwndArgs = info.isolated && info.windowId ? ["--hwnd", String(info.windowId)] : [];
+        const readiness = await waitForDebugChannel({
+          hwndArgs,
+          sinceSeq: processManager.getLogSeq(),
+          timeoutMs: 12000,
+        });
+        if (!readiness.ready) {
+          entry.stateReset = false;
+          entry.stateResetReason = "channel-unavailable-after-run";
+        } else {
+          try {
+            const cleared = await runDebugCommand("reset", [], 2500);
+            if (cleared.ok) {
+              await stopRunningApp();
+              const startedAt = Date.now();
+              const rerun = await processManager.runAppInSimulator(sdk, {
+                prgPath,
+                deviceId,
+                waitMs: args.wait_ms ?? 3000,
+              });
+              entry.runAfterReset = {
+                launched: rerun.launched,
+                startupConfirmed: rerun.startupConfirmed ?? false,
+                ms: Date.now() - startedAt,
+                fatalError: rerun.fatalError,
+              };
+              stateReset = rerun.launched;
+              if (stateReset) {
+                entry.stateResetPhase = "after-run-restart";
+                entry.stateResetReason = undefined;
+              } else {
+                entry.stateResetReason = "restart-failed";
+              }
+            } else {
+              entry.stateResetReason = `reset-rejected: ${cleared.data}`;
+            }
+          } catch (error) {
+            entry.stateResetReason = error instanceof Error ? error.message : String(error);
+          }
+        }
+      }
+      entry.stateReset = stateReset;
 
       await new Promise((resolve) => setTimeout(resolve, args.settle_ms ?? 1200));
 

@@ -26,6 +26,8 @@ export interface IsolatedLaunchResult {
   bounds?: { x: number; y: number; width: number; height: number };
   clientSize?: { width: number; height: number };
   expectedClientWidth?: number;
+  windowStable: boolean;
+  placeholderSize: boolean;
 }
 
 /**
@@ -56,6 +58,7 @@ export async function launchIsolatedSimulator(options: {
     const deadline = Date.now() + (options.waitMs ?? 25000);
     let stable: { width: number; height: number } | undefined;
     let stableCount = 0;
+    let stableReached = false;
     let firstWindowAt: number | undefined;
     let info = await getWindowInfo(desktop);
 
@@ -84,6 +87,7 @@ export async function launchIsolatedSimulator(options: {
           stableCount = 1;
         }
         if (stableCount >= 3) {
+          stableReached = true;
           break;
         }
       }
@@ -99,6 +103,9 @@ export async function launchIsolatedSimulator(options: {
 
     isolatedPid = info.pid ?? launchedPid;
     setActiveDesktop(desktop);
+    const placeholderSize =
+      options.expectedClientWidth !== undefined &&
+      (info.clientSize?.width ?? 0) < options.expectedClientWidth;
     return {
       desktop,
       pid: info.pid ?? launchedPid,
@@ -106,6 +113,8 @@ export async function launchIsolatedSimulator(options: {
       bounds: info.bounds,
       clientSize: info.clientSize,
       expectedClientWidth: options.expectedClientWidth,
+      windowStable: stableReached,
+      placeholderSize,
     };
   } catch (error) {
     setActiveDesktop(undefined);

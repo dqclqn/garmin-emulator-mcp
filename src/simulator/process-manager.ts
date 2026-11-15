@@ -67,7 +67,8 @@ export interface RunUnitTestsResult {
   summary: UnitTestSummary;
   signal?: NodeJS.Signals | null;
   timedOut?: boolean;
-  exitCodeWarning?: string;
+  /** Raw SDK exit code when it differs from the normalized exitCode. */
+  sdkExitCode?: number;
 }
 
 export interface GetLogsOptions {
@@ -959,21 +960,22 @@ export class SimulatorProcessManager {
         const exitAcceptable = exitCode === 0 || exitCode === 1;
         const passed = !signal && exitAcceptable && !fatalRunnerOutput && summary.complete &&
           summary.executed > 0 && summary.failed === 0 && summary.errors === 0;
-        const exitCodeWarning = passed && exitCode !== 0
-          ? `SDK runner exited ${exitCode} despite a complete PASSED summary.` : undefined;
+        // Normalize the known SDK 9.x wrapper quirk without hiding the raw
+        // exit code. A passing summary means the runner result is trustworthy.
+        const normalizedExitCode = passed && exitCode === 1 ? 0 : exitCode;
 
         this.appendLog(
           "system",
-          `Unit tests completed with exitCode=${exitCode}, passed=${passed}`
+          `Unit tests completed with exitCode=${exitCode}, normalizedExitCode=${normalizedExitCode}, passed=${passed}`
         );
 
         finish({
           passed,
-          exitCode,
+          exitCode: normalizedExitCode,
           output: combinedOutput,
           summary,
           signal,
-          exitCodeWarning,
+          sdkExitCode: normalizedExitCode !== exitCode ? exitCode : undefined,
         });
       });
     });

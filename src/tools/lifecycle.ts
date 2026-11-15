@@ -303,12 +303,19 @@ export async function handleLaunchSimulator(args?: {
                 isolated: true,
                 desktop: isolated.desktop,
                 portOpen,
-                ready: true,
+                processReady: portOpen && isolated.windowStable,
+                ready: portOpen && isolated.windowStable && !isolated.placeholderSize,
+                geometryReady: !isolated.placeholderSize,
+                windowStable: isolated.windowStable,
+                placeholderSize: isolated.placeholderSize,
+                expectedClientWidth: isolated.expectedClientWidth,
                 activeDeviceId,
                 window: isolated.bounds,
                 clientSize: isolated.clientSize,
                 permissions: status.permissions,
-                note: "The simulator runs on a hidden desktop. Button input is delivered there without changing your foreground window.",
+                note: isolated.placeholderSize
+                  ? "The simulator is running on a hidden desktop but its window still has the pre-app placeholder size. Run the app before using calibrated display geometry."
+                  : "The simulator runs on a hidden desktop. Button input is delivered there without changing your foreground window.",
               },
               null,
               2
@@ -740,7 +747,7 @@ export async function handleRunUnitTests(args: {
               summary: result.summary,
               signal: result.signal,
               timedOut: result.timedOut ?? false,
-              exitCodeWarning: result.exitCodeWarning,
+              sdkExitCode: result.sdkExitCode,
             },
             null,
             2

@@ -38,7 +38,10 @@ try {
       prgPath: process.platform === "win32" ? fixture : mode, deviceId: "fenix847mm", timeoutMs: mode === "timeout" ? 2500 : 8000,
     });
     assert.equal(result.passed, expected, mode);
-    if (mode === "exit1") assert.match(result.exitCodeWarning ?? "", /exited 1 despite a complete PASSED summary/);
+    if (mode === "exit1") {
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.sdkExitCode, 1);
+    }
     if (mode === "exit2") assert.equal(result.exitCode, 2);
     if (mode === "signal") assert.equal(result.signal, "SIGTERM");
     if (mode === "timeout") {
